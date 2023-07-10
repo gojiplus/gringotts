@@ -1,0 +1,39 @@
+openapi: 3.0.3
+info:
+  title: ML API
+  description: API for ML model
+  version: 1.0.0
+servers:
+  - url: http://localhost:8000/api/v1
+paths:
+  /predict:
+    post:
+      summary: Perform prediction
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                input_string:
+                  type: string
+                api_key:
+                  type: string
+              required:
+                - input_string
+                - api_key
+      responses:
+        '200':
+          description: Successful operation
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  output_string:
+                    type: string
+        '400':
+          description: Invalid input
+        '401':
+          description: Unauthorized
