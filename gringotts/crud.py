@@ -26,6 +26,24 @@ def update_user_credits(db: Session, user: models.User, delta: int) -> models.Us
     return user
 
 
+def deduct_user_credits(db: Session, user: models.User, cost: int) -> bool:
+    """Atomically deduct credits if the user has enough.
+
+    Returns True if deduction succeeded, False otherwise.
+    """
+    updated = (
+        db.query(models.User)
+        .filter(models.User.id == user.id, models.User.credits >= cost)
+        .update({models.User.credits: models.User.credits - cost})
+    )
+    if not updated:
+        db.rollback()
+        return False
+    db.commit()
+    db.refresh(user)
+    return True
+
+
 def log_api_call(db: Session, user: models.User, endpoint: str, cost: int) -> models.APICall:
     call = models.APICall(user_id=user.id, endpoint=endpoint, cost=cost)
     db.add(call)
