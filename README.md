@@ -16,6 +16,18 @@ Users can:
 4. Monitor their API credits remaining and the requests they made and how much each cost
 5. Get response from an API if API Key has credits remaining. Otherwise error 'too few credits.'
 
+### Quick Example
+
+```python
+from crud import create_user, read_user
+
+# Create a user and look it up
+create_user("alice", "password", "alice@example.com", "key123", 100)
+print(read_user("alice"))
+```
+
+Run `python gringotts/example.py` for a more complete demonstration.
+
 Automatically create when user is created
 Add Credits
 
