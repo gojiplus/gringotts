@@ -1,6 +1,6 @@
 from sqlalchemy.orm import Session
 
-from . import models, auth
+from . import auth, models
 
 
 def create_user(db: Session, username: str, api_key_hash: str, credits: int = 0) -> models.User:
@@ -12,10 +12,9 @@ def create_user(db: Session, username: str, api_key_hash: str, credits: int = 0)
 
 
 def get_user_by_api_key(db: Session, api_key: str) -> models.User | None:
-    for user in db.query(models.User).all():
-        if auth.verify_api_key(api_key, user.api_key_hash):
-            return user
-    return None
+    """Return the user matching the given API key."""
+    hash_ = auth.get_api_key_hash(api_key)
+    return db.query(models.User).filter(models.User.api_key_hash == hash_).first()
 
 
 def update_user_credits(db: Session, user: models.User, delta: int) -> models.User:

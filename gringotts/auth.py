@@ -1,8 +1,6 @@
+import hashlib
 import secrets
-from passlib.context import CryptContext
 from sqlalchemy.orm import Session
-
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 
 def generate_api_key() -> str:
@@ -10,11 +8,12 @@ def generate_api_key() -> str:
 
 
 def get_api_key_hash(api_key: str) -> str:
-    return pwd_context.hash(api_key)
+    """Return a deterministic hash for the given API key."""
+    return hashlib.sha256(api_key.encode()).hexdigest()
 
 
 def verify_api_key(api_key: str, hashed: str) -> bool:
-    return pwd_context.verify(api_key, hashed)
+    return get_api_key_hash(api_key) == hashed
 
 
 def create_user_with_key(db: Session, username: str, credits: int = 0):
