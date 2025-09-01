@@ -46,9 +46,8 @@ def requires_credits(cost: int = 1):
                     user = crud.get_user_by_api_key(db, api_key)
                     if not user:
                         raise InvalidAPIKey()
-                    if user.credits < cost:
+                    if not crud.deduct_user_credits(db, user, cost):
                         raise InsufficientCredits()
-                    crud.update_user_credits(db, user, -cost)
                     crud.log_api_call(db, user, request.url.path, cost)
                 finally:
                     db.close()
@@ -70,9 +69,8 @@ def requires_credits(cost: int = 1):
                     user = crud.get_user_by_api_key(db, api_key)
                     if not user:
                         raise InvalidAPIKey()
-                    if user.credits < cost:
+                    if not crud.deduct_user_credits(db, user, cost):
                         raise InsufficientCredits()
-                    crud.update_user_credits(db, user, -cost)
                     crud.log_api_call(db, user, getattr(request, "path", ""), cost)
                 finally:
                     db.close()
