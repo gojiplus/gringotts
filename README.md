@@ -16,20 +16,30 @@ Users can:
 4. Monitor their API credits remaining and the requests they made and how much each cost
 5. Get response from an API if API Key has credits remaining. Otherwise error 'too few credits.'
 
-Automatically create when user is created
-Add Credits
+### Quick Example
 
+1. Start the API:
 
+```bash
+uvicorn gringotts.main:app
+```
 
-Call API Endpoint: 
-Updates transactions table
-Updates user table (total remaining credits)
-	
-How?
-We log who made the call using the API Key
-Checks if there are remaining credits. If yes, then calls the API and updates the tables. Otherwise 
+2. Create a user and API key:
 
+```python
+from gringotts import auth, db
+db_session = db.SessionLocal()
+user, api_key = auth.create_user_with_key(db_session, "alice", credits=5)
+print(api_key)
+```
 
+3. Call the protected endpoint:
 
+```bash
+curl -X POST "http://localhost:8000/predict" \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: $API_KEY" \
+  -d '{"input_string": "hello"}'
+```
 
 ### Authors
