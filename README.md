@@ -42,4 +42,24 @@ curl -X POST "http://localhost:8000/predict" \
   -d '{"input_string": "hello"}'
 ```
 
+### Development
+
+Install dependencies and run the test suite:
+
+```bash
+python -m venv venv
+source venv/bin/activate
+pip install -r gringotts/requirements.txt
+pytest -q
+```
+
+### CLI Helpers
+
+Manage users and credits from the command line:
+
+```bash
+python -m gringotts.cli create-user alice --credits 5
+python -m gringotts.cli add-credits alice 3
+```
+
 ### Authors
