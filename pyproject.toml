@@ -114,8 +114,9 @@ include = ["src"]
 typeCheckingMode = "standard"
 
 [tool.preen]
-# TODO(first release): remove — links check 404s on PyPI/pepy badges and the
-# docs URL until the first publish and Pages deploy exist.
+# pepy.tech does not index a package until it has download history, so the
+# Downloads badge 404s for about a day after a first publish. Everything else
+# the links check covers now resolves; drop this once pepy picks the package up.
 skip_checks = ["links"]
 
 [tool.pydoclint]
