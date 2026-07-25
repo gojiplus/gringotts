@@ -1,0 +1,94 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "gringotts-api"
+version = "0.1.0"
+description = "Prepaid credits for your FastAPI, with your own Stripe account, in 5 minutes."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Gaurav Sood", email = "gsood07@gmail.com" }]
+requires-python = ">=3.10"
+keywords = [
+  "fastapi",
+  "stripe",
+  "api-monetization",
+  "credits",
+  "metering",
+  "billing",
+  "http-402",
+]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Framework :: FastAPI",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Internet :: WWW/HTTP",
+  "Topic :: Office/Business :: Financial",
+]
+dependencies = [
+  "fastapi>=0.110",
+  "sqlalchemy>=2.0",
+  "stripe>=10.0",
+  "python-multipart>=0.0.9",
+]
+
+[project.urls]
+Homepage = "https://github.com/soodoku/gringotts"
+Repository = "https://github.com/soodoku/gringotts"
+Issues = "https://github.com/soodoku/gringotts/issues"
+Changelog = "https://github.com/soodoku/gringotts/blob/main/CHANGELOG.md"
+
+[project.scripts]
+gringotts = "gringotts.cli:main"
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+  "httpx>=0.27",
+  "ruff>=0.5",
+  "mypy>=1.10",
+  "uvicorn>=0.30",
+  "psycopg2-binary>=2.9; sys_platform != 'win32'",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["gringotts"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM"]
+
+[tool.ruff.lint.flake8-bugbear]
+extend-immutable-calls = [
+  "fastapi.Depends",
+  "fastapi.Form",
+  "Depends",
+  "Form",
+  "charge",
+  "gringotts.charge",
+]
+
+[tool.mypy]
+python_version = "3.10"
+strict = false
+check_untyped_defs = true
+warn_unused_ignores = true
+no_implicit_optional = true
+
+[[tool.mypy.overrides]]
+module = "stripe.*"
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

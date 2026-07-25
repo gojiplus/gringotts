@@ -1,6 +1,7 @@
-from datetime import datetime
-from sqlalchemy import Column, Integer, String, DateTime, ForeignKey
-from sqlalchemy.orm import relationship
+from datetime import datetime, timezone
+
+from sqlalchemy import DateTime, ForeignKey, String
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .db import Base
 
@@ -8,21 +9,34 @@ from .db import Base
 class User(Base):
     __tablename__ = "users"
 
-    id = Column(Integer, primary_key=True, index=True)
-    username = Column(String, unique=True, index=True, nullable=False)
-    api_key_hash = Column(String, unique=True, nullable=False)
-    credits = Column(Integer, default=0)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    username: Mapped[str] = mapped_column(String, unique=True, index=True)
+    api_key_hash: Mapped[str] = mapped_column(String, unique=True)
+    key_last4: Mapped[str] = mapped_column(String(4), default="")
+    credits: Mapped[int] = mapped_column(default=0)
+    is_admin: Mapped[bool] = mapped_column(default=False)
 
-    calls = relationship("APICall", back_populates="user")
+    transactions: Mapped[list["CreditTransaction"]] = relationship(back_populates="user")
 
 
-class APICall(Base):
-    __tablename__ = "api_calls"
+class CreditTransaction(Base):
+    """Append-only ledger. Sum of amounts per user always equals the user's balance."""
 
-    id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
-    endpoint = Column(String, nullable=False)
-    cost = Column(Integer, nullable=False)
-    timestamp = Column(DateTime, default=datetime.utcnow)
+    __tablename__ = "credit_transactions"
 
-    user = relationship("User", back_populates="calls")
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    # negative for charges, positive for grants/refunds/purchases
+    amount: Mapped[int]
+    kind: Mapped[str] = mapped_column(String(16))
+    # unique id of the originating external event (e.g. Stripe event id);
+    # the unique constraint is what makes webhook crediting idempotent
+    external_id: Mapped[str | None] = mapped_column(String, unique=True, default=None)
+    endpoint: Mapped[str | None] = mapped_column(String, default=None)
+    # money actually paid, set only on purchase rows (Checkout amount_total)
+    amount_cents: Mapped[int | None] = mapped_column(default=None)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
+    )
+
+    user: Mapped[User] = relationship(back_populates="transactions")

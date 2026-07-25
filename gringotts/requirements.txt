@@ -1,3 +1,0 @@
-fastapi
-sqlalchemy
-httpx

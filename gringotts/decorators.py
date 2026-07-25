@@ -1,23 +1,16 @@
+"""Legacy decorator API. Prefer ``Depends(charge(cost))`` from gringotts.dependencies."""
+
 import inspect
 from functools import wraps
+from typing import Any
 
-from fastapi import HTTPException, Request
+from fastapi import Request
 
-from .db import SessionLocal
-from . import crud
-
-
-class InvalidAPIKey(HTTPException):
-    def __init__(self) -> None:
-        super().__init__(status_code=401, detail="Invalid API key")
+from . import crud, db
+from .dependencies import API_KEY_HEADER, authenticate
 
 
-class InsufficientCredits(HTTPException):
-    def __init__(self) -> None:
-        super().__init__(status_code=402, detail="Insufficient credits")
-
-
-def _extract_request(args, kwargs):
+def _extract_request(args: tuple[Any, ...], kwargs: dict[str, Any]) -> Request | None:
     request = kwargs.get("request")
     if request is None:
         for arg in args:
@@ -28,41 +21,61 @@ def _extract_request(args, kwargs):
 
 
 def requires_credits(cost: int = 1):
-    """Decorator to enforce that a request has enough credits."""
+    """Charge `cost` credits before running the endpoint; refund if it raises.
+
+    The endpoint must accept the ``Request`` object. New code should use
+    ``Depends(charge(cost))`` instead, which also injects the user.
+    """
 
     def decorator(func):
-        def _process_request(args, kwargs):
+        def _charge(args: tuple[Any, ...], kwargs: dict[str, Any]) -> tuple[int, str]:
             request = _extract_request(args, kwargs)
             if request is None:
                 raise RuntimeError("Request object not found")
 
-            api_key = request.headers.get("X-API-Key")
-            if not api_key:
-                raise InvalidAPIKey()
-
-            db = SessionLocal()
+            endpoint = request.url.path
+            session = db.SessionLocal()
             try:
-                user = crud.get_user_by_api_key(db, api_key)
-                if not user:
-                    raise InvalidAPIKey()
-                if not crud.deduct_user_credits(db, user, cost):
-                    raise InsufficientCredits()
-                path = getattr(getattr(request, "url", None), "path", getattr(request, "path", ""))
-                crud.log_api_call(db, user, path, cost)
+                user = authenticate(session, request.headers.get(API_KEY_HEADER))
+                from .exceptions import PaymentRequiredError
+
+                if not crud.charge_user(session, user, cost, endpoint=endpoint):
+                    raise PaymentRequiredError(cost=cost, balance=user.credits)
+                return user.id, endpoint
             finally:
-                db.close()
+                session.close()
+
+        def _refund(user_id: int, endpoint: str) -> None:
+            session = db.SessionLocal()
+            try:
+                user = crud.get_user(session, user_id)
+                if user is not None:
+                    crud.refund_user(session, user, cost, endpoint=endpoint)
+            finally:
+                session.close()
 
         if inspect.iscoroutinefunction(func):
+
+            @wraps(func)
             async def async_wrapper(*args, **kwargs):
-                _process_request(args, kwargs)
-                return await func(*args, **kwargs)
+                user_id, endpoint = _charge(args, kwargs)
+                try:
+                    return await func(*args, **kwargs)
+                except Exception:
+                    _refund(user_id, endpoint)
+                    raise
 
-            return wraps(func)(async_wrapper)
-        else:
-            def sync_wrapper(*args, **kwargs):
-                _process_request(args, kwargs)
+            return async_wrapper
+
+        @wraps(func)
+        def sync_wrapper(*args, **kwargs):
+            user_id, endpoint = _charge(args, kwargs)
+            try:
                 return func(*args, **kwargs)
+            except Exception:
+                _refund(user_id, endpoint)
+                raise
 
-            return wraps(func)(sync_wrapper)
+        return sync_wrapper
 
     return decorator
