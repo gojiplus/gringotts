@@ -113,6 +113,11 @@ source = ["src"]
 include = ["src"]
 typeCheckingMode = "standard"
 
+[tool.preen]
+# TODO(first release): remove — links check 404s on PyPI/pepy badges and the
+# docs URL until the first publish and Pages deploy exist.
+skip_checks = ["links"]
+
 [tool.pydoclint]
 style = "google"
 arg-type-hints-in-docstring = false
