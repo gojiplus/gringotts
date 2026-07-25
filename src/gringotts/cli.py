@@ -1,9 +1,12 @@
+"""Command-line management: init-db, users, admin flags, and credits."""
+
 import argparse
 
 from . import auth, crud, db, models  # noqa: F401  (models import registers tables)
 
 
 def main(argv: list[str] | None = None) -> None:
+    """Parse arguments and run the requested management command."""
     parser = argparse.ArgumentParser(
         prog="gringotts", description="Manage Gringotts users and credits"
     )
@@ -11,10 +14,14 @@ def main(argv: list[str] | None = None) -> None:
 
     sub.add_parser("init-db", help="Create the database tables")
 
-    p_create = sub.add_parser("create-user", help="Create a user and print the API key (once)")
+    p_create = sub.add_parser(
+        "create-user", help="Create a user and print the API key (once)"
+    )
     p_create.add_argument("username")
     p_create.add_argument("--credits", type=int, default=0)
-    p_create.add_argument("--admin", action="store_true", help="Give the user admin access")
+    p_create.add_argument(
+        "--admin", action="store_true", help="Give the user admin access"
+    )
 
     p_admin = sub.add_parser("set-admin", help="Grant or revoke admin access")
     p_admin.add_argument("username")
@@ -60,7 +67,8 @@ def main(argv: list[str] | None = None) -> None:
             user = crud.get_user_by_username(session, args.username)
             if user is None:
                 raise SystemExit(f"User {args.username} not found")
-            print(f"User {user.username} has {user.credits} credits (key ...{user.key_last4})")
+            last4 = user.key_last4
+            print(f"User {user.username} has {user.credits} credits (key ...{last4})")
     finally:
         session.close()
 

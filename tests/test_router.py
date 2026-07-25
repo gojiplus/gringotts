@@ -36,7 +36,9 @@ def sign(payload: bytes, secret: str = WEBHOOK_SECRET) -> str:
     return f"t={timestamp},v1={signature}"
 
 
-def checkout_completed_event(user_id: int, credits: int, event_id: str = "evt_1") -> bytes:
+def checkout_completed_event(
+    user_id: int, credits: int, event_id: str = "evt_1"
+) -> bytes:
     return json.dumps(
         {
             "id": event_id,
@@ -112,7 +114,9 @@ def test_checkout_rejects_bad_key_and_pack(db_session, monkeypatch):
         lambda **kwargs: SimpleNamespace(url="https://example.com"),
     )
     client = TestClient(make_app(), follow_redirects=False)
-    bad_key = client.post("/gringotts/checkout", data={"api_key": "gk_bad", "pack": "0"})
+    bad_key = client.post(
+        "/gringotts/checkout", data={"api_key": "gk_bad", "pack": "0"}
+    )
     assert bad_key.status_code == 401
     bad_pack = client.post("/gringotts/checkout", data={"api_key": key, "pack": "9"})
     assert bad_pack.status_code == 400
@@ -153,7 +157,10 @@ def test_webhook_is_idempotent(db_session):
 
     db_session.refresh(user)
     assert user.credits == 100
-    assert db_session.query(models.CreditTransaction).filter_by(kind="purchase").count() == 1
+    assert (
+        db_session.query(models.CreditTransaction).filter_by(kind="purchase").count()
+        == 1
+    )
 
 
 def test_webhook_rejects_bad_signature(db_session):
@@ -173,7 +180,12 @@ def test_webhook_rejects_bad_signature(db_session):
 
 def test_webhook_ignores_other_events(db_session):
     payload = json.dumps(
-        {"id": "evt_2", "object": "event", "type": "invoice.paid", "data": {"object": {}}}
+        {
+            "id": "evt_2",
+            "object": "event",
+            "type": "invoice.paid",
+            "data": {"object": {}},
+        }
     ).encode()
     client = TestClient(make_app())
     res = client.post(

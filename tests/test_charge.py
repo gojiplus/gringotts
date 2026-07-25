@@ -25,7 +25,9 @@ def make_app():
 
     @app.get("/units")
     def units(
-        user: CreditedUser = Depends(charge(lambda r: int(r.headers.get("X-Units", "1")))),
+        user: CreditedUser = Depends(
+            charge(lambda r: int(r.headers.get("X-Units", "1")))
+        ),
     ):
         return {"credits": user.credits}
 
@@ -90,10 +92,11 @@ def test_402_accepts_lists_purchase_url_when_stripe_configured(db_session):
         return {"msg": "world"}
 
     _, key = auth.create_user_with_key(db_session, "cara", credits=0)
-    res = TestClient(app).get("/hello", headers={"X-API-Key": key})
+    client = TestClient(app, base_url="http://example.com")
+    res = client.get("/hello", headers={"X-API-Key": key})
     assert res.status_code == 402
     assert res.json()["accepts"] == [
-        {"type": "stripe-checkout", "url": "http://testserver/gringotts/buy"}
+        {"type": "stripe-checkout", "url": "http://example.com/gringotts/buy"}
     ]
 
 
@@ -107,17 +110,22 @@ def test_refund_on_handler_exception(db_session):
     db_session.refresh(user)
     assert user.credits == 5
     kinds = [
-        t.kind for t in db_session.query(models.CreditTransaction).filter_by(user_id=user.id).all()
+        t.kind
+        for t in db_session.query(models.CreditTransaction)
+        .filter_by(user_id=user.id)
+        .all()
     ]
     assert kinds.count("charge") == 1
     assert kinds.count("refund") == 1
 
 
 def test_no_refund_on_success(db_session):
-    user, key = auth.create_user_with_key(db_session, "ed", credits=5)
+    _, key = auth.create_user_with_key(db_session, "ed", credits=5)
     client = TestClient(make_app())
     client.get("/hello", headers={"X-API-Key": key})
-    refunds = db_session.query(models.CreditTransaction).filter_by(kind="refund").count()
+    refunds = (
+        db_session.query(models.CreditTransaction).filter_by(kind="refund").count()
+    )
     assert refunds == 0
 
 
@@ -131,8 +139,13 @@ def test_callable_cost(db_session):
 
 
 def test_concurrent_charges_never_overspend(tmp_path):
-    url = os.getenv("GRINGOTTS_TEST_DATABASE_URL") or f"sqlite:///{tmp_path}/concurrency.db"
-    connect_args = {"check_same_thread": False, "timeout": 30} if url.startswith("sqlite") else {}
+    url = (
+        os.getenv("GRINGOTTS_TEST_DATABASE_URL")
+        or f"sqlite:///{tmp_path}/concurrency.db"
+    )
+    connect_args = (
+        {"check_same_thread": False, "timeout": 30} if url.startswith("sqlite") else {}
+    )
     engine = create_engine(url, connect_args=connect_args)
     session_local = sessionmaker(autocommit=False, autoflush=False, bind=engine)
     Base.metadata.drop_all(bind=engine)

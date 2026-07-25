@@ -1,4 +1,6 @@
-from datetime import datetime, timezone
+"""SQLAlchemy models: users and the append-only credit ledger."""
+
+from datetime import UTC, datetime
 
 from sqlalchemy import DateTime, ForeignKey, String
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -7,6 +9,8 @@ from .db import Base
 
 
 class User(Base):
+    """An API consumer: hashed key, current balance, and optional admin flag."""
+
     __tablename__ = "users"
 
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -16,11 +20,16 @@ class User(Base):
     credits: Mapped[int] = mapped_column(default=0)
     is_admin: Mapped[bool] = mapped_column(default=False)
 
-    transactions: Mapped[list["CreditTransaction"]] = relationship(back_populates="user")
+    transactions: Mapped[list["CreditTransaction"]] = relationship(
+        back_populates="user"
+    )
 
 
 class CreditTransaction(Base):
-    """Append-only ledger. Sum of amounts per user always equals the user's balance."""
+    """Append-only ledger row.
+
+    The sum of amounts per user always equals the user's balance.
+    """
 
     __tablename__ = "credit_transactions"
 
@@ -36,7 +45,7 @@ class CreditTransaction(Base):
     # money actually paid, set only on purchase rows (Checkout amount_total)
     amount_cents: Mapped[int | None] = mapped_column(default=None)
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
+        DateTime(timezone=True), default=lambda: datetime.now(UTC)
     )
 
     user: Mapped[User] = relationship(back_populates="transactions")

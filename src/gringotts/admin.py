@@ -23,6 +23,7 @@ def _is_htmx(request: Request) -> bool:
 
 
 def build_admin_router(config: GringottsConfig) -> APIRouter:
+    """Build the admin router (dashboard shell, stats, users, activity)."""
     router = APIRouter()
     mount = config.mount_path
 
@@ -50,7 +51,8 @@ def build_admin_router(config: GringottsConfig) -> APIRouter:
   </section>
   <section>
     <h2>Activity</h2>
-    <div id="activity" hx-get="{mount}/admin/activity" hx-trigger="load, every 5s"></div>
+    <div id="activity" hx-get="{mount}/admin/activity"
+         hx-trigger="load, every 5s"></div>
   </section>
 </div>"""
         return pages.shell("Gringotts admin", body, mount)
@@ -87,7 +89,7 @@ def build_admin_router(config: GringottsConfig) -> APIRouter:
             f"<td>...{html.escape(u['key_last4'])}</td>"
             f'<td class="num">{u["balance"]}</td>'
             f'<td class="num">{u["consumed"]}</td>'
-            f"<td>{html.escape((u['last_activity'] or '—')[:16].replace('T', ' '))}</td>"
+            f"<td>{html.escape((u['last_activity'] or '—')[:16])}</td>"
             f"<td><form class='inline' hx-post='{mount}/admin/users/{u['id']}/grant'"
             f" hx-target='#users'>"
             f"<input name='amount' type='number' value='10' min='1'>"
@@ -112,7 +114,9 @@ def build_admin_router(config: GringottsConfig) -> APIRouter:
     ):
         if crud.get_user_by_username(db, username) is not None:
             raise HTTPException(status_code=409, detail="Username already exists")
-        user, api_key = auth.create_user_with_key(db, username, credits, is_admin=is_admin)
+        user, api_key = auth.create_user_with_key(
+            db, username, credits, is_admin=is_admin
+        )
         if not _is_htmx(request):
             return JSONResponse(
                 {

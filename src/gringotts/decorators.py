@@ -1,4 +1,4 @@
-"""Legacy decorator API. Prefer ``Depends(charge(cost))`` from gringotts.dependencies."""
+"""Legacy decorator API; prefer ``Depends(charge(cost))`` from dependencies."""
 
 import inspect
 from functools import wraps

@@ -1,3 +1,5 @@
+"""Stripe Checkout session creation for credit packs."""
+
 import stripe
 
 from .config import CreditPack, GringottsConfig

@@ -23,7 +23,7 @@ def make_admin(db_session, credits=0):
 
 
 def test_usage_endpoint_paginates_newest_first(db_session):
-    user, key = auth.create_user_with_key(db_session, "ada", credits=10)
+    _, key = auth.create_user_with_key(db_session, "ada", credits=10)
     client = TestClient(make_app())
     client.get("/hello", headers={"X-API-Key": key})
     client.get("/hello", headers={"X-API-Key": key})
@@ -48,8 +48,14 @@ def test_admin_routes_reject_non_admins(db_session):
     _, key = auth.create_user_with_key(db_session, "ada", credits=1)
     client = TestClient(make_app())
     assert client.get("/gringotts/admin/stats").status_code == 401
-    assert client.get("/gringotts/admin/stats", headers={"X-API-Key": key}).status_code == 403
-    assert client.get("/gringotts/admin/users", headers={"X-API-Key": key}).status_code == 403
+    assert (
+        client.get("/gringotts/admin/stats", headers={"X-API-Key": key}).status_code
+        == 403
+    )
+    assert (
+        client.get("/gringotts/admin/users", headers={"X-API-Key": key}).status_code
+        == 403
+    )
 
 
 def test_admin_users_list_and_stats(db_session):
@@ -61,13 +67,17 @@ def test_admin_users_list_and_stats(db_session):
         db_session, user, 100, kind="purchase", external_id="evt_a", amount_cents=500
     )
 
-    users = client.get("/gringotts/admin/users", headers={"X-API-Key": admin_key}).json()["users"]
+    users = client.get(
+        "/gringotts/admin/users", headers={"X-API-Key": admin_key}
+    ).json()["users"]
     ada = next(u for u in users if u["username"] == "ada")
     assert ada["balance"] == 108
     assert ada["consumed"] == 2
     assert ada["last_activity"] is not None
 
-    stats = client.get("/gringotts/admin/stats", headers={"X-API-Key": admin_key}).json()
+    stats = client.get(
+        "/gringotts/admin/stats", headers={"X-API-Key": admin_key}
+    ).json()
     assert stats["users"] == 2
     assert stats["credits_outstanding"] == 108
     assert stats["credits_consumed"] == 2
@@ -90,7 +100,9 @@ def test_admin_create_user_key_works_immediately(db_session):
     assert body["credits"] == 5
     assert body["is_admin"] is False
 
-    assert client.get("/hello", headers={"X-API-Key": body["api_key"]}).status_code == 200
+    assert (
+        client.get("/hello", headers={"X-API-Key": body["api_key"]}).status_code == 200
+    )
 
     dupe = client.post(
         "/gringotts/admin/users",
@@ -130,11 +142,15 @@ def test_content_negotiation_html_for_htmx(db_session):
     as_json = client.get("/gringotts/admin/users", headers={"X-API-Key": admin_key})
     assert as_json.headers["content-type"].startswith("application/json")
 
-    as_html = client.get("/gringotts/admin/users", headers={"X-API-Key": admin_key, **HX})
+    as_html = client.get(
+        "/gringotts/admin/users", headers={"X-API-Key": admin_key, **HX}
+    )
     assert as_html.headers["content-type"].startswith("text/html")
     assert "<table>" in as_html.text
 
-    stats_html = client.get("/gringotts/admin/stats", headers={"X-API-Key": admin_key, **HX})
+    stats_html = client.get(
+        "/gringotts/admin/stats", headers={"X-API-Key": admin_key, **HX}
+    )
     assert 'class="tiles"' in stats_html.text
 
 
@@ -144,9 +160,9 @@ def test_admin_activity_and_user_usage(db_session):
     client = TestClient(make_app())
     client.get("/hello", headers={"X-API-Key": key})
 
-    activity = client.get("/gringotts/admin/activity", headers={"X-API-Key": admin_key}).json()[
-        "transactions"
-    ]
+    activity = client.get(
+        "/gringotts/admin/activity", headers={"X-API-Key": admin_key}
+    ).json()["transactions"]
     assert activity[0]["kind"] == "charge"
     assert activity[0]["endpoint"] == "/hello"
 

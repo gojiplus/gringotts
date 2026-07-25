@@ -79,6 +79,7 @@ def shell(title: str, body: str, mount: str) -> str:
 
 
 def tile(value: str, label: str) -> str:
+    """Render one stat tile: a hero number with a muted label."""
     return (
         f'<div class="tile"><div class="num">{html.escape(value)}</div>'
         f'<div class="lbl">{html.escape(label)}</div></div>'
@@ -86,6 +87,7 @@ def tile(value: str, label: str) -> str:
 
 
 def usage_table(transactions: Sequence[CreditTransaction]) -> str:
+    """Render ledger rows as an HTML table (or a friendly empty state)."""
     if not transactions:
         return '<p class="muted">No activity yet.</p>'
     rows = "".join(

@@ -1,16 +1,15 @@
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling>=1.27", "uv-dynamic-versioning"]
 build-backend = "hatchling.build"
 
 [project]
 name = "gringotts-api"
-version = "0.1.0"
 description = "Prepaid credits for your FastAPI, with your own Stripe account, in 5 minutes."
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
 authors = [{ name = "Gaurav Sood", email = "gsood07@gmail.com" }]
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 keywords = [
   "fastapi",
   "stripe",
@@ -25,12 +24,6 @@ classifiers = [
   "Framework :: FastAPI",
   "Intended Audience :: Developers",
   "Programming Language :: Python :: 3",
-  "Programming Language :: Python :: 3.10",
-  "Programming Language :: Python :: 3.11",
-  "Programming Language :: Python :: 3.12",
-  "Programming Language :: Python :: 3.13",
-  "Topic :: Internet :: WWW/HTTP",
-  "Topic :: Office/Business :: Financial",
 ]
 dependencies = [
   "fastapi>=0.110",
@@ -38,35 +31,61 @@ dependencies = [
   "stripe>=10.0",
   "python-multipart>=0.0.9",
 ]
+dynamic = ["version"]
 
 [project.urls]
-Homepage = "https://github.com/soodoku/gringotts"
-Repository = "https://github.com/soodoku/gringotts"
-Issues = "https://github.com/soodoku/gringotts/issues"
-Changelog = "https://github.com/soodoku/gringotts/blob/main/CHANGELOG.md"
+Homepage = "https://github.com/gojiplus/gringotts"
+Documentation = "https://gojiplus.github.io/gringotts/"
+Repository = "https://github.com/gojiplus/gringotts"
+"Bug Tracker" = "https://github.com/gojiplus/gringotts/issues"
 
 [project.scripts]
 gringotts = "gringotts.cli:main"
 
-[project.optional-dependencies]
+[dependency-groups]
 dev = [
-  "pytest>=8.0",
-  "httpx>=0.27",
-  "ruff>=0.5",
-  "mypy>=1.10",
+  "ruff>=0.14",
+  "pyright>=1.1.390",
+  "pydoclint>=0.5",
+  "pre-commit>=4",
   "uvicorn>=0.30",
+  { include-group = "test" },
+]
+test = [
+  "pytest>=8",
+  "pytest-cov>=6",
+  "httpx>=0.27",
   "psycopg2-binary>=2.9; sys_platform != 'win32'",
+]
+docs = [
+  "sphinx>=8",
+  "furo",
+  "myst-parser",
+  "sphinx-copybutton",
+  "py-canon @ git+https://github.com/gojiplus/py-canon@v1",
 ]
 
 [tool.hatch.build.targets.wheel]
-packages = ["gringotts"]
+packages = ["src/gringotts"]
+
+[tool.hatch.version]
+source = "uv-dynamic-versioning"
+
+[tool.uv-dynamic-versioning]
+vcs = "git"
+style = "pep440"
 
 [tool.ruff]
-line-length = 100
-target-version = "py310"
+line-length = 88
+target-version = "py311"
 
 [tool.ruff.lint]
-select = ["E", "F", "W", "I", "UP", "B", "SIM"]
+external = ["DOC"]
+select = ["E", "W", "F", "I", "B", "C4", "UP", "N", "D", "S", "SIM", "T20", "PT", "RUF"]
+ignore = ["D203", "D213"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
 
 [tool.ruff.lint.flake8-bugbear]
 extend-immutable-calls = [
@@ -78,17 +97,26 @@ extend-immutable-calls = [
   "gringotts.charge",
 ]
 
-[tool.mypy]
-python_version = "3.10"
-strict = false
-check_untyped_defs = true
-warn_unused_ignores = true
-no_implicit_optional = true
-
-[[tool.mypy.overrides]]
-module = "stripe.*"
-ignore_missing_imports = true
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101", "S105", "S106", "D"]
+"docs/**" = ["D"]
+"examples/**" = ["T20", "D", "S311"]
+"src/gringotts/cli.py" = ["T20"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-q"
+
+[tool.coverage.run]
+source = ["src"]
+
+[tool.pyright]
+include = ["src"]
+typeCheckingMode = "standard"
+
+[tool.pydoclint]
+style = "google"
+arg-type-hints-in-docstring = false
+check-return-types = false
+check-class-attributes = false
+allow-init-docstring = true
+exclude = '\.venv|tests|docs'

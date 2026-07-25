@@ -1,0 +1,13 @@
+# Managed by copier — records template version for `copier update`. Do not edit.
+_commit: v1
+_src_path: gh:gojiplus/py-canon
+author_email: gsood07@gmail.com
+author_name: Gaurav Sood
+coverage_floor: 70
+default_branch: main
+description: Prepaid credits for your FastAPI, with your own Stripe account, in 5
+    minutes.
+needs_cli: true
+org: gojiplus
+package_name: gringotts
+project_name: gringotts-api

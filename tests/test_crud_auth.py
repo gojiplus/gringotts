@@ -5,7 +5,10 @@ from gringotts import auth, cli, crud, models
 
 def ledger_sum(db, user_id):
     return (
-        db.query(func.sum(models.CreditTransaction.amount)).filter_by(user_id=user_id).scalar() or 0
+        db.query(func.sum(models.CreditTransaction.amount))
+        .filter_by(user_id=user_id)
+        .scalar()
+        or 0
     )
 
 
@@ -41,7 +44,9 @@ def test_charge_user_atomic_with_ledger(db_session):
     assert user.credits == 1
     assert ledger_sum(db_session, user.id) == user.credits
     charge_rows = (
-        db_session.query(models.CreditTransaction).filter_by(user_id=user.id, kind="charge").all()
+        db_session.query(models.CreditTransaction)
+        .filter_by(user_id=user.id, kind="charge")
+        .all()
     )
     assert len(charge_rows) == 1
     assert charge_rows[0].amount == -2
@@ -50,9 +55,13 @@ def test_charge_user_atomic_with_ledger(db_session):
 
 def test_grant_credits_idempotent_by_external_id(db_session):
     user, _ = auth.create_user_with_key(db_session, "erin", credits=0)
-    assert crud.grant_credits(db_session, user, 100, kind="purchase", external_id="evt_1")
+    assert crud.grant_credits(
+        db_session, user, 100, kind="purchase", external_id="evt_1"
+    )
     assert user.credits == 100
-    assert not crud.grant_credits(db_session, user, 100, kind="purchase", external_id="evt_1")
+    assert not crud.grant_credits(
+        db_session, user, 100, kind="purchase", external_id="evt_1"
+    )
     db_session.refresh(user)
     assert user.credits == 100
     assert ledger_sum(db_session, user.id) == 100

@@ -1,5 +1,11 @@
 # Gringotts
 
+[![PyPI version](https://img.shields.io/pypi/v/gringotts-api.svg)](https://pypi.org/project/gringotts-api/)
+[![Downloads](https://static.pepy.tech/badge/gringotts-api)](https://pepy.tech/project/gringotts-api)
+[![CI](https://github.com/gojiplus/gringotts/actions/workflows/ci.yml/badge.svg)](https://github.com/gojiplus/gringotts/actions/workflows/ci.yml)
+[![Documentation](https://github.com/gojiplus/gringotts/actions/workflows/docs.yml/badge.svg)](https://gojiplus.github.io/gringotts/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
 **Prepaid credits for your FastAPI, with your own Stripe account, in 5 minutes.**
 
 You built a useful API. Gringotts lets you charge for it per request — API

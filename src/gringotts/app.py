@@ -1,3 +1,5 @@
+"""Application wiring: `init_app` registers the 402 handler and mounts routes."""
+
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
@@ -8,8 +10,11 @@ from .router import build_router
 
 
 def init_app(app: FastAPI, config: GringottsConfig | None = None) -> None:
-    """Register the 402 handler and mount the gringotts routes
-    (balance, purchase page, checkout, Stripe webhook) under config.mount_path."""
+    """Register the 402 handler and mount the gringotts routes.
+
+    Routes (balance, usage, account, purchase page, checkout, webhook, admin)
+    land under `config.mount_path`.
+    """
     cfg = config or GringottsConfig()
     app.state.gringotts = cfg
 
@@ -18,8 +23,12 @@ def init_app(app: FastAPI, config: GringottsConfig | None = None) -> None:
         if cfg.stripe_enabled:
             base = str(request.base_url).rstrip("/")
             purchase_url = f"{base}{cfg.mount_path}/buy"
-        return JSONResponse(status_code=402, content=payment_required_body(exc, purchase_url))
+        return JSONResponse(
+            status_code=402, content=payment_required_body(exc, purchase_url)
+        )
 
     app.add_exception_handler(PaymentRequiredError, handle_payment_required)  # type: ignore[arg-type]
     app.include_router(build_router(cfg), prefix=cfg.mount_path, tags=["gringotts"])
-    app.include_router(build_admin_router(cfg), prefix=cfg.mount_path, tags=["gringotts-admin"])
+    app.include_router(
+        build_admin_router(cfg), prefix=cfg.mount_path, tags=["gringotts-admin"]
+    )

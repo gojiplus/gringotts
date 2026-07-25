@@ -1,3 +1,5 @@
+"""User-facing routes: balance, usage, account page, purchase flow, webhook."""
+
 import html
 from importlib.resources import files
 
@@ -39,11 +41,15 @@ def _require_stripe(config: GringottsConfig) -> None:
     if not config.stripe_enabled:
         raise HTTPException(
             status_code=503,
-            detail="Stripe is not configured (set STRIPE_SECRET_KEY and define credit packs)",
+            detail=(
+                "Stripe is not configured "
+                "(set STRIPE_SECRET_KEY and define credit packs)"
+            ),
         )
 
 
 def build_router(config: GringottsConfig) -> APIRouter:
+    """Build the user-facing router for the given configuration."""
     router = APIRouter()
 
     @router.get("/static/htmx.min.js", include_in_schema=False)
@@ -74,7 +80,9 @@ def build_router(config: GringottsConfig) -> APIRouter:
         user = authenticate(db, request.headers.get(API_KEY_HEADER))
         limit = max(1, min(limit, 500))
         offset = max(0, offset)
-        transactions = crud.list_transactions(db, user_id=user.id, limit=limit, offset=offset)
+        transactions = crud.list_transactions(
+            db, user_id=user.id, limit=limit, offset=offset
+        )
         return {
             "balance": user.credits,
             "transactions": [
@@ -92,7 +100,8 @@ def build_router(config: GringottsConfig) -> APIRouter:
     def account_page():
         body = (
             f'<div id="panel" hx-get="{config.mount_path}/account/panel"'
-            ' hx-trigger="load, every 10s"><p class="muted">Paste your API key above.</p></div>'
+            ' hx-trigger="load, every 10s">'
+            '<p class="muted">Paste your API key above.</p></div>'
         )
         return pages.shell("Your account", body, config.mount_path)
 
@@ -108,7 +117,9 @@ def build_router(config: GringottsConfig) -> APIRouter:
         return (
             '<div class="tiles">'
             + pages.tile(str(user.credits), "credits remaining")
-            + pages.tile(f"...{user.key_last4}", f"API key ({html.escape(user.username)})")
+            + pages.tile(
+                f"...{user.key_last4}", f"API key ({html.escape(user.username)})"
+            )
             + "</div>"
             + buy_link
             + "<h2>Recent activity</h2>"
@@ -119,14 +130,17 @@ def build_router(config: GringottsConfig) -> APIRouter:
     def buy_page(status: str | None = None):
         _require_stripe(config)
         pack_inputs = "\n".join(
-            f'<label><input type="radio" name="pack" value="{i}" {"checked" if i == 0 else ""}>'
+            f'<label><input type="radio" name="pack" value="{i}"'
+            f" {'checked' if i == 0 else ''}>"
             f" {html.escape(pack.name)} — {pack.credits} credits for "
             f"{pack.price_cents / 100:.2f} {pack.currency.upper()}</label>"
             for i, pack in enumerate(config.packs)
         )
         status_html = ""
         if status == "success":
-            status_html = "<p><strong>Payment received — credits are on their way.</strong></p>"
+            status_html = (
+                "<p><strong>Payment received — credits are on their way.</strong></p>"
+            )
         elif status == "cancelled":
             status_html = "<p>Payment cancelled.</p>"
         checkout_path = f"{config.mount_path}/checkout"
@@ -149,19 +163,27 @@ def build_router(config: GringottsConfig) -> APIRouter:
             user, config.packs[pack], config, str(request.base_url)
         )
         if not session.url:
-            raise HTTPException(status_code=502, detail="Stripe returned no checkout URL")
+            raise HTTPException(
+                status_code=502, detail="Stripe returned no checkout URL"
+            )
         return RedirectResponse(session.url, status_code=303)
 
     @router.post("/webhook")
     async def webhook(request: Request, db: Session = Depends(get_session)):
         if not config.stripe_webhook_secret:
-            raise HTTPException(status_code=503, detail="Stripe webhook secret is not configured")
+            raise HTTPException(
+                status_code=503, detail="Stripe webhook secret is not configured"
+            )
         payload = await request.body()
         signature = request.headers.get("stripe-signature", "")
         try:
-            event = stripe.Webhook.construct_event(payload, signature, config.stripe_webhook_secret)
+            event = stripe.Webhook.construct_event(
+                payload, signature, config.stripe_webhook_secret
+            )
         except (ValueError, stripe.SignatureVerificationError) as err:
-            raise HTTPException(status_code=400, detail="Invalid webhook signature") from err
+            raise HTTPException(
+                status_code=400, detail="Invalid webhook signature"
+            ) from err
 
         if event["type"] == "checkout.session.completed":
             # stripe's typed objects raise KeyError (not .get) on missing keys

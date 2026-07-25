@@ -1,3 +1,5 @@
+"""FastAPI dependencies: authentication, admin gating, and the charge() core."""
+
 from collections.abc import Callable, Iterator
 
 from fastapi import Depends, HTTPException, Request
@@ -16,6 +18,7 @@ API_KEY_HEADER = "X-API-Key"
 
 
 def authenticate(db: Session, api_key: str | None) -> User:
+    """Resolve an API key to its user or raise a 401."""
     if not api_key:
         raise InvalidAPIKeyError()
     user = crud.get_user_by_api_key(db, api_key)
@@ -25,6 +28,7 @@ def authenticate(db: Session, api_key: str | None) -> User:
 
 
 def require_admin(request: Request, db: Session = Depends(get_session)) -> User:
+    """FastAPI dependency: authenticate and require the admin flag (403 otherwise)."""
     user = authenticate(db, request.headers.get(API_KEY_HEADER))
     if not user.is_admin:
         raise HTTPException(status_code=403, detail="Admin access required")
@@ -32,17 +36,22 @@ def require_admin(request: Request, db: Session = Depends(get_session)) -> User:
 
 
 def charge(cost: CostSpec) -> Callable[..., Iterator[User]]:
-    """FastAPI dependency that authenticates the X-API-Key header and charges
-    `cost` credits (an int, or a callable computing it from the request).
+    """Build the dependency that authenticates and charges for a request.
 
-    Yields the charged user. If the endpoint raises, the charge is refunded
-    with a compensating ledger entry.
+    The dependency yields the charged user; if the endpoint raises, the
+    charge is refunded with a compensating ledger entry.
 
-        @app.post("/predict")
-        def predict(user: CreditedUser = Depends(charge(5))): ...
+    Args:
+        cost: Credits to charge — an int, or a callable computing it from
+            the request (e.g. per-unit pricing).
+
+    Returns:
+        A FastAPI dependency usable as ``Depends(charge(5))``.
     """
 
-    def dependency(request: Request, db: Session = Depends(get_session)) -> Iterator[User]:
+    def dependency(
+        request: Request, db: Session = Depends(get_session)
+    ) -> Iterator[User]:
         user = authenticate(db, request.headers.get(API_KEY_HEADER))
         amount = cost(request) if callable(cost) else cost
         endpoint = request.url.path
