@@ -99,8 +99,23 @@ def _add_balance_after(conn) -> None:
         )
 
 
+def _add_payment_intent_id(conn) -> None:
+    if not _has_column(conn, "credit_transactions", "payment_intent_id"):
+        conn.execute(
+            text("ALTER TABLE credit_transactions ADD COLUMN payment_intent_id VARCHAR")
+        )
+    # matches the index create_all builds for the indexed model column
+    conn.execute(
+        text(
+            "CREATE INDEX IF NOT EXISTS ix_credit_transactions_payment_intent_id "
+            "ON credit_transactions (payment_intent_id)"
+        )
+    )
+
+
 STEPS: list[tuple[int, str, Callable]] = [
     (1, "add balance_after running-balance to credit_transactions", _add_balance_after),
+    (2, "add payment_intent_id to credit_transactions", _add_payment_intent_id),
 ]
 
 HEAD = STEPS[-1][0] if STEPS else 0

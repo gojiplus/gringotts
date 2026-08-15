@@ -12,7 +12,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response
 from sqlalchemy.orm import Session
 
 from . import auth, crud, pages
-from .config import GringottsConfig
+from .config import GringottsConfig, format_money
 from .db import get_session
 from .dependencies import require_admin
 from .models import User
@@ -66,12 +66,13 @@ def build_admin_router(config: GringottsConfig) -> APIRouter:
         data = crud.aggregate_stats(db)
         if not _is_htmx(request):
             return JSONResponse(data)
+        currency = config.packs[0].currency if config.packs else "usd"
         tiles = (
             pages.tile(str(data["users"]), "users")
             + pages.tile(str(data["credits_outstanding"]), "credits outstanding")
             + pages.tile(str(data["credits_consumed"]), "credits consumed")
             + pages.tile(str(data["credits_purchased"]), "credits purchased")
-            + pages.tile(f"{data['revenue_cents'] / 100:,.2f}", "revenue")
+            + pages.tile(format_money(data["revenue_cents"], currency), "revenue")
         )
         return HTMLResponse(f'<div class="tiles">{tiles}</div>')
 

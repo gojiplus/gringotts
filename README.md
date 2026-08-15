@@ -42,7 +42,9 @@ your purchase page; Stripe Checkout tops them up.
   network calls, no rev share, no vendor that can shut down under you.
 - **Correct where it's hard to be**: atomic credit deduction (no overspend under
   concurrency), automatic refund when your handler raises, idempotent webhook
-  crediting, and an append-only ledger auditing every credit movement.
+  crediting, refund/dispute clawback (clamped so a balance never goes negative),
+  and an append-only ledger — with a per-row running balance — auditing every
+  credit movement.
 - **Agent-ready 402**: the insufficient-credits response is typed JSON
   (x402-compatible vocabulary), so AI-agent clients can parse it and pay.
 
@@ -106,7 +108,11 @@ The package installs as `gringotts` (the bare PyPI name was taken).
    `checkout.session.completed` — and also `checkout.session.async_payment_succeeded`
    if you enable delayed payment methods (e.g. ACH), where the completed event
    arrives before the money settles. Credits are granted only once the session's
-   `payment_status` is `paid`. For local testing:
+   `payment_status` is `paid`. To claw credits back when a payment is refunded or
+   disputed, also register `refund.created`, `refund.updated`,
+   `charge.dispute.funds_withdrawn`, and `charge.dispute.funds_reinstated` — a
+   refund reverses a proportional share of the granted credits (clamped at zero,
+   never negative), and a lost dispute reverses the purchase. For local testing:
 
    ```bash
    stripe listen --forward-to localhost:8000/gringotts/webhook

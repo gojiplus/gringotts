@@ -3,10 +3,51 @@
 import os
 from dataclasses import dataclass, field
 
+# Currencies with no minor unit — Stripe's amount is already the whole-unit value
+# (e.g. JPY 500 means ¥500, not ¥5.00). Source of truth:
+# https://docs.stripe.com/currencies#zero-decimal
+_ZERO_DECIMAL_CURRENCIES = frozenset(
+    {
+        "bif",
+        "clp",
+        "djf",
+        "gnf",
+        "jpy",
+        "kmf",
+        "krw",
+        "mga",
+        "pyg",
+        "rwf",
+        "ugx",
+        "vnd",
+        "vuv",
+        "xaf",
+        "xof",
+        "xpf",
+    }
+)
+
+
+def is_zero_decimal(currency: str) -> bool:
+    """Whether `currency` has no minor unit (so `price_cents` is whole units)."""
+    return currency.lower() in _ZERO_DECIMAL_CURRENCIES
+
+
+def format_money(minor_units: int, currency: str) -> str:
+    """Format a Stripe smallest-unit amount for display, currency-aware."""
+    upper = currency.upper()
+    if is_zero_decimal(currency):
+        return f"{minor_units:,} {upper}"
+    return f"{minor_units / 100:,.2f} {upper}"
+
 
 @dataclass(frozen=True)
 class CreditPack:
-    """A purchasable bundle: `credits` for `price_cents` in `currency`."""
+    """A purchasable bundle: `credits` for `price_cents` in `currency`.
+
+    `price_cents` is the amount in the currency's smallest unit — cents for USD,
+    whole yen for JPY and other zero-decimal currencies.
+    """
 
     credits: int
     price_cents: int

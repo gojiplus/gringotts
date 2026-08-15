@@ -56,6 +56,11 @@ class CreditTransaction(Base):
     endpoint: Mapped[str | None] = mapped_column(String, default=None)
     # money actually paid, set only on purchase rows (Checkout amount_total)
     amount_cents: Mapped[int | None] = mapped_column(default=None)
+    # Stripe PaymentIntent id, set on purchase rows; lets refund/dispute events
+    # (which carry payment_intent, not the checkout session) find this purchase
+    payment_intent_id: Mapped[str | None] = mapped_column(
+        String, index=True, default=None
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(UTC)
     )

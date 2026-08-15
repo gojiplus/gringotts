@@ -10,7 +10,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from sqlalchemy.orm import Session
 
 from . import billing, crud, pages
-from .config import GringottsConfig
+from .config import GringottsConfig, format_money
 from .db import get_session
 from .dependencies import API_KEY_HEADER, authenticate
 
@@ -24,6 +24,88 @@ _FULFILL_EVENTS = {
     "checkout.session.async_payment_succeeded",
 }
 _PAID_STATUSES = {"paid", "no_payment_required"}
+
+# Reversal events. A refund (possibly partial) claws back a proportional share
+# of the granted credits; a dispute claws back on funds_withdrawn and re-credits
+# on funds_reinstated. The "warning_*" dispute events move no funds, so ignore.
+_REFUND_EVENTS = {"refund.created", "refund.updated"}
+_DISPUTE_WITHDRAWN = "charge.dispute.funds_withdrawn"
+_DISPUTE_REINSTATED = "charge.dispute.funds_reinstated"
+
+
+def _process_refund(db, event) -> None:
+    """Claw back credits proportional to a Stripe refund (clamped at zero)."""
+    refund = event["data"]["object"]
+    try:
+        payment_intent_id = refund["payment_intent"]
+        refund_id = refund["id"]
+        refund_amount = int(refund["amount"])
+    except (KeyError, TypeError, ValueError):
+        logger.error("gringotts webhook %s: refund missing fields", event["id"])
+        return
+    purchase = crud.find_purchase_by_payment_intent(db, payment_intent_id)
+    if purchase is None or not purchase.amount_cents:
+        logger.warning(
+            "gringotts webhook %s: refund for an unknown or pre-0.3 purchase "
+            "(payment_intent=%s); cannot claw back",
+            event["id"],
+            payment_intent_id,
+        )
+        return
+    user = crud.get_user(db, purchase.user_id)
+    if user is None:
+        logger.error("gringotts webhook %s: refund user missing", event["id"])
+        return
+    # proportional to the fraction of the payment refunded
+    to_claw = round(purchase.amount * refund_amount / purchase.amount_cents)
+    crud.clawback_credits(
+        db, user, to_claw, external_id=refund_id, endpoint="stripe:refund"
+    )
+
+
+def _process_dispute(db, event, *, reinstate: bool) -> None:
+    """Claw back on a lost/withdrawn dispute, re-credit on a reinstated one."""
+    dispute = event["data"]["object"]
+    try:
+        payment_intent_id = dispute["payment_intent"]
+        dispute_id = dispute["id"]
+    except (KeyError, TypeError):
+        logger.error("gringotts webhook %s: dispute missing fields", event["id"])
+        return
+    purchase = crud.find_purchase_by_payment_intent(db, payment_intent_id)
+    if purchase is None:
+        logger.warning(
+            "gringotts webhook %s: dispute for an unknown or pre-0.3 purchase "
+            "(payment_intent=%s); cannot act",
+            event["id"],
+            payment_intent_id,
+        )
+        return
+    user = crud.get_user(db, purchase.user_id)
+    if user is None:
+        logger.error("gringotts webhook %s: dispute user missing", event["id"])
+        return
+    withdrawn_key = f"{dispute_id}:withdrawn"
+    if reinstate:
+        # restore exactly what was clawed back for this dispute (clamp-aware)
+        restored = crud.clawback_deducted(db, withdrawn_key)
+        if restored:
+            crud.grant_credits(
+                db,
+                user,
+                restored,
+                kind="reinstate",
+                external_id=f"{dispute_id}:reinstated",
+            )
+    else:
+        crud.clawback_credits(
+            db,
+            user,
+            purchase.amount,
+            external_id=withdrawn_key,
+            endpoint="stripe:dispute",
+        )
+
 
 _BUY_PAGE = """<!doctype html>
 <html>
@@ -145,7 +227,7 @@ def build_router(config: GringottsConfig) -> APIRouter:
             f'<label><input type="radio" name="pack" value="{i}"'
             f" {'checked' if i == 0 else ''}>"
             f" {html.escape(pack.name)} — {pack.credits} credits for "
-            f"{pack.price_cents / 100:.2f} {pack.currency.upper()}</label>"
+            f"{format_money(pack.price_cents, pack.currency)}</label>"
             for i, pack in enumerate(config.packs)
         )
         status_html = ""
@@ -239,6 +321,10 @@ def build_router(config: GringottsConfig) -> APIRouter:
                 amount_cents = int(session["amount_total"])
             except (KeyError, TypeError, ValueError):
                 amount_cents = None
+            try:
+                payment_intent_id = session["payment_intent"]
+            except (KeyError, TypeError):
+                payment_intent_id = None
             user = crud.get_user(db, user_id)
             if user is None:
                 # Usually transient (the user existed when checkout was created;
@@ -272,12 +358,19 @@ def build_router(config: GringottsConfig) -> APIRouter:
                 kind="purchase",
                 external_id=session_id,
                 amount_cents=amount_cents,
+                payment_intent_id=payment_intent_id,
             )
             if not granted:
                 logger.info(
                     "gringotts webhook: checkout session %s already credited",
                     session_id,
                 )
+        elif event["type"] in _REFUND_EVENTS:
+            _process_refund(db, event)
+        elif event["type"] == _DISPUTE_WITHDRAWN:
+            _process_dispute(db, event, reinstate=False)
+        elif event["type"] == _DISPUTE_REINSTATED:
+            _process_dispute(db, event, reinstate=True)
         return {"received": True}
 
     return router
