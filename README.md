@@ -102,8 +102,11 @@ The package installs as `gringotts` (the bare PyPI name was taken).
    | `GET /gringotts/account` | Account page for your users: balance, usage, buy link |
    | `GET /gringotts/admin` | Admin dashboard (requires an admin key, see below) |
 
-   Point a Stripe webhook (event `checkout.session.completed`) at
-   `POST /gringotts/webhook`. For local testing:
+   Point a Stripe webhook at `POST /gringotts/webhook` for
+   `checkout.session.completed` — and also `checkout.session.async_payment_succeeded`
+   if you enable delayed payment methods (e.g. ACH), where the completed event
+   arrives before the money settles. Credits are granted only once the session's
+   `payment_status` is `paid`. For local testing:
 
    ```bash
    stripe listen --forward-to localhost:8000/gringotts/webhook
@@ -179,16 +182,23 @@ Payments Protocol) can be added later without breaking the shape.
 Two tables, created by `gringotts init-db`:
 
 - `users` — username, SHA-256 hash of the API key (the key itself is shown
-  once and never stored), last 4 characters for display, current balance.
+  once and never stored), last 4 characters for display, current balance. A
+  database `CHECK (credits >= 0)` backstops the non-negative-balance invariant.
 - `credit_transactions` — an append-only ledger. Every charge, refund, grant,
   and purchase is a signed row written in the same transaction as the balance
-  update, so the ledger always sums to the balance. Purchases carry the Stripe
-  event id under a unique constraint — that's what makes webhook crediting
-  idempotent.
+  update, and each row also stores `balance_after` (the running balance as of
+  that row), so the balance is auditable per row and drift is structurally
+  detectable: `gringotts reconcile` checks that a user's cached `credits`, the
+  running `SUM(amount)`, and the latest `balance_after` all agree. Purchases
+  carry the Stripe checkout session id under a unique constraint — that's what
+  makes webhook crediting idempotent, even when Stripe sends more than one event
+  for the same session.
 
 Works on SQLite out of the box and Postgres via
 `DATABASE_URL=postgresql://...` (both run in CI, including a parallel-writer
-test that proves no overspend).
+test that proves no overspend). On SQLite the engine uses WAL and a
+`busy_timeout` (default 30s, `GRINGOTTS_SQLITE_BUSY_TIMEOUT` to change) so
+concurrent writers wait rather than erroring with "database is locked."
 
 ## Configuration
 
@@ -210,27 +220,39 @@ gringotts create-user ops --admin
 gringotts set-admin alice          # or --revoke
 gringotts add-credits alice 100
 gringotts balance alice
+gringotts reconcile                # flag any balance that disagrees with the ledger
+gringotts migrate                  # apply pending schema changes to an existing DB
 ```
+
+Upgrading an existing database is `gringotts migrate` (not a recreate): it
+applies forward-only, idempotent schema changes in place, and refuses to run if
+the ledger doesn't already reconcile. Upgrading from 0.1.x: webhook idempotency
+now keys on the checkout-session id rather than the Stripe event id, so **drain
+any in-flight delayed (ACH) payments before upgrading** — a settlement arriving
+afterward can't be matched to a 0.1-era purchase row and could be credited twice
+(`gringotts migrate` warns when it finds such rows).
 
 ## Not yet (deliberately)
 
 Subscriptions and recurring billing, postpaid invoicing, decimal or
-multi-currency pricing, rate limiting, x402/MPP crypto settlement,
-key rotation, and schema migrations (pre-1.0, recreate with `init-db`). The
-ledger is designed so these can be added without schema breaks.
+multi-currency pricing, rate limiting, x402/MPP crypto settlement, and
+key rotation. Credit expiration is deliberately out of scope pre-1.0: honest
+expiration needs FIFO lot-tracking, and unexpired prepaid credits are the
+operator's liability to manage. The ledger is designed so these can be added
+without schema breaks, and `gringotts migrate` applies additive schema changes
+in place.
 
-Known v0.1 limitation: a charge is refunded when your handler *raises*; a
+Known limitation: a charge is refunded when your handler *raises*; a
 handler that *returns* a 5xx response, or a process crash mid-request, is not
 auto-refunded — both are visible in the ledger.
 
 ## Development
 
 ```bash
-python -m venv .venv && source .venv/bin/activate
-pip install -e ".[dev]"
-pytest
-ruff check . && ruff format --check .
-mypy gringotts
+uv sync
+uv run pytest
+uv run ruff check . && uv run ruff format --check .
+uv run pyright
 ```
 
 ## License

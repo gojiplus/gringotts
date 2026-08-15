@@ -1,14 +1,18 @@
 """FastAPI dependencies: authentication, admin gating, and the charge() core."""
 
+import asyncio
+import logging
 from collections.abc import Callable, Iterator
 
 from fastapi import Depends, HTTPException, Request
 from sqlalchemy.orm import Session
 
-from . import crud
+from . import crud, db
 from .db import get_session
 from .exceptions import InvalidAPIKeyError, PaymentRequiredError
 from .models import User
+
+logger = logging.getLogger(__name__)
 
 CreditedUser = User
 
@@ -49,18 +53,50 @@ def charge(cost: CostSpec) -> Callable[..., Iterator[User]]:
         A FastAPI dependency usable as ``Depends(charge(5))``.
     """
 
-    def dependency(
-        request: Request, db: Session = Depends(get_session)
-    ) -> Iterator[User]:
-        user = authenticate(db, request.headers.get(API_KEY_HEADER))
-        amount = cost(request) if callable(cost) else cost
-        endpoint = request.url.path
-        if not crud.charge_user(db, user, amount, endpoint=endpoint):
-            raise PaymentRequiredError(cost=amount, balance=user.credits)
+    def dependency(request: Request) -> Iterator[User]:
+        # Credit movement runs on its own session, never the host app's
+        # request session — so gringotts never commits or rolls back the
+        # caller's pending work.
+        session = db.SessionLocal()
         try:
-            yield user
-        except Exception:
-            crud.refund_user(db, user, amount, endpoint=endpoint)
-            raise
+            user = authenticate(session, request.headers.get(API_KEY_HEADER))
+            amount = cost(request) if callable(cost) else cost
+            if amount < 0:
+                raise HTTPException(status_code=400, detail="Invalid credit cost")
+            endpoint = request.url.path
+            if not crud.charge_user(session, user, amount, endpoint=endpoint):
+                raise PaymentRequiredError(cost=amount, balance=user.credits)
+            user_id = user.id
+            try:
+                yield user
+            except (Exception, asyncio.CancelledError):
+                # Refund on any abnormal exit, including a client disconnect
+                # (CancelledError is a BaseException, so `except Exception`
+                # alone would let it consume credits for undelivered work).
+                # GeneratorExit is deliberately not caught: it fires on normal
+                # close and must not trigger a refund.
+                _refund_on_fresh_session(user_id, amount, endpoint)
+                raise
+        finally:
+            session.close()
 
     return dependency
+
+
+def _refund_on_fresh_session(user_id: int, amount: int, endpoint: str) -> None:
+    """Compensate a charge on a brand-new session.
+
+    Using a fresh session means a failing handler's uncommitted mutations to
+    the yielded user (on the charge session) are discarded when that session
+    closes, never committed by the refund.
+    """
+    session = db.SessionLocal()
+    try:
+        user = crud.get_user(session, user_id)
+        if user is not None:
+            crud.refund_user(session, user, amount, endpoint=endpoint)
+    except Exception:
+        # Best-effort: never let a failed refund mask the original exception.
+        logger.exception("gringotts: refund failed for user %s", user_id)
+    finally:
+        session.close()

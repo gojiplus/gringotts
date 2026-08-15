@@ -23,9 +23,15 @@ def create_user(
         credits=credits,
         is_admin=is_admin,
     )
+    if credits < 0:
+        raise ValueError("initial credits cannot be negative")
     db.add(user)
     if credits:
-        db.add(models.CreditTransaction(user=user, amount=credits, kind="grant"))
+        db.add(
+            models.CreditTransaction(
+                user=user, amount=credits, kind="grant", balance_after=credits
+            )
+        )
     db.commit()
     db.refresh(user)
     return user
@@ -54,7 +60,13 @@ def charge_user(
 
     The ledger row is written in the same transaction as the balance update.
     Returns False (and leaves the balance untouched) when credits are short.
+    A `cost` of 0 is a no-op that succeeds without a ledger row; a negative
+    `cost` raises ValueError, since a charge must never raise a balance.
     """
+    if cost < 0:
+        raise ValueError("charge cost cannot be negative")
+    if cost == 0:
+        return True
     updated = (
         db.query(models.User)
         .filter(models.User.id == user.id, models.User.credits >= cost)
@@ -64,9 +76,14 @@ def charge_user(
         db.rollback()
         db.refresh(user)
         return False
+    db.refresh(user)  # balance after the debit, our own in-transaction write
     db.add(
         models.CreditTransaction(
-            user_id=user.id, amount=-cost, kind="charge", endpoint=endpoint
+            user_id=user.id,
+            amount=-cost,
+            kind="charge",
+            endpoint=endpoint,
+            balance_after=user.credits,
         )
     )
     db.commit()
@@ -77,13 +94,26 @@ def charge_user(
 def refund_user(
     db: Session, user: models.User, amount: int, endpoint: str | None = None
 ) -> models.User:
-    """Return `amount` credits to the user with a compensating ledger row."""
+    """Return `amount` credits to the user with a compensating ledger row.
+
+    An `amount` of 0 is a no-op that writes no ledger row; a negative `amount`
+    raises ValueError, since a refund must never deduct.
+    """
+    if amount < 0:
+        raise ValueError("refund amount cannot be negative")
+    if amount == 0:
+        return user
     db.query(models.User).filter(models.User.id == user.id).update(
         {models.User.credits: models.User.credits + amount}
     )
+    db.refresh(user)
     db.add(
         models.CreditTransaction(
-            user_id=user.id, amount=amount, kind="refund", endpoint=endpoint
+            user_id=user.id,
+            amount=amount,
+            kind="refund",
+            endpoint=endpoint,
+            balance_after=user.credits,
         )
     )
     db.commit()
@@ -102,11 +132,15 @@ def grant_credits(
     """Atomically add credits with a ledger row.
 
     Returns False when `external_id` was already processed, making
-    event-driven crediting (e.g. Stripe webhooks) idempotent.
+    event-driven crediting (e.g. Stripe webhooks) idempotent. A negative
+    `amount` raises ValueError, since a grant must never deduct.
     """
+    if amount < 0:
+        raise ValueError("grant amount cannot be negative")
     db.query(models.User).filter(models.User.id == user.id).update(
         {models.User.credits: models.User.credits + amount}
     )
+    db.refresh(user)
     db.add(
         models.CreditTransaction(
             user_id=user.id,
@@ -114,15 +148,31 @@ def grant_credits(
             kind=kind,
             external_id=external_id,
             amount_cents=amount_cents,
+            balance_after=user.credits,
         )
     )
     try:
         db.commit()
     except IntegrityError:
         db.rollback()
-        return False
+        # Only a duplicate external_id means "already processed" (idempotent
+        # replay). Any other integrity failure is a real error we must not
+        # swallow, or a valid grant would vanish silently.
+        if external_id is not None and external_id_exists(db, external_id):
+            return False
+        raise
     db.refresh(user)
     return True
+
+
+def external_id_exists(db: Session, external_id: str) -> bool:
+    """Whether a ledger row already carries this external id."""
+    return (
+        db.query(models.CreditTransaction.id)
+        .filter(models.CreditTransaction.external_id == external_id)
+        .first()
+        is not None
+    )
 
 
 def list_transactions(
@@ -201,6 +251,48 @@ def aggregate_stats(db: Session) -> dict:
         "credits_purchased": _sum_for("purchase", models.CreditTransaction.amount),
         "revenue_cents": _sum_for("purchase", models.CreditTransaction.amount_cents),
     }
+
+
+def find_balance_discrepancies(db: Session) -> list[dict]:
+    """Return users whose ledger fails the running-balance consistency check.
+
+    For each user, walking the append-only ledger oldest-first, every row's
+    `balance_after` must equal the cumulative `SUM(amount)` up to that row, and
+    the final running total must equal the cached `credits`. This validates the
+    whole chain, not just the latest row, so corruption or a NULL in any earlier
+    row is caught. An empty list means every balance reconciles.
+    """
+    users = db.query(models.User).order_by(models.User.id).all()
+    discrepancies = []
+    for user in users:
+        rows = (
+            db.query(models.CreditTransaction)
+            .filter(models.CreditTransaction.user_id == user.id)
+            .order_by(models.CreditTransaction.id)
+            .all()
+        )
+        running = 0
+        bad_rows = 0
+        null_rows = 0
+        for row in rows:
+            running += row.amount
+            if row.balance_after is None:
+                null_rows += 1
+            elif row.balance_after != running:
+                bad_rows += 1
+        if user.credits != running or bad_rows or null_rows:
+            discrepancies.append(
+                {
+                    "id": user.id,
+                    "username": user.username,
+                    "cached": user.credits,
+                    "ledger": running,
+                    "balance_after": rows[-1].balance_after if rows else 0,
+                    "bad_balance_after_rows": bad_rows,
+                    "null_balance_after_rows": null_rows,
+                }
+            )
+    return discrepancies
 
 
 def set_admin(db: Session, user: models.User, is_admin: bool) -> models.User:

@@ -50,6 +50,7 @@ def checkout_completed_event(
                     "id": "cs_test_1",
                     "object": "checkout.session",
                     "amount_total": 500,
+                    "payment_status": "paid",
                     "metadata": {
                         "gringotts_user_id": str(user_id),
                         "credits": str(credits),
@@ -137,7 +138,8 @@ def test_webhook_credits_user(db_session):
     db_session.refresh(user)
     assert user.credits == 100
     row = db_session.query(models.CreditTransaction).filter_by(kind="purchase").one()
-    assert row.external_id == "evt_1"
+    # idempotency is keyed on the checkout session id, not the event id
+    assert row.external_id == "cs_test_1"
     assert row.amount == 100
     assert row.amount_cents == 500
 

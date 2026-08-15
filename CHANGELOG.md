@@ -4,6 +4,68 @@ All notable changes to this project are documented in this file. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-08-15
+
+A money-correctness pass (an independent multi-model audit) plus a
+strong-consistency and in-place-upgrade foundation.
+
+### Fixed
+
+- **Negative/zero cost can no longer mint credits.** `charge()` rejects a
+  negative client-derived cost (e.g. `X-Units: -1000`, which previously
+  *increased* the balance) with a 400, and a zero cost is a no-op with no
+  ledger row.
+- **Webhook checks `payment_status` before crediting** and now also handles
+  `checkout.session.async_payment_succeeded`, so a delayed (ACH) payment credits
+  only once it settles — not on the initial unpaid `completed` event.
+- **Webhook idempotency is keyed on the Checkout Session id**, not the Stripe
+  event id, so two events for one paid session no longer double-credit the buyer.
+- **`charge()` uses its own database session** instead of the host app's request
+  session: it no longer commits the caller's uncommitted work, loses the
+  compensating refund when the handler leaves its session in a failed
+  transaction, or lets a failing handler's mutations to the user (e.g.
+  `is_admin = True`) get committed by the auto-refund.
+- **Non-positive amounts are rejected server-side** on admin grant, CLI
+  `add-credits`, admin create-user initial credits, and `CreditPack` (the HTML
+  `min` attribute was the only guard before).
+- **Unfulfillable paid webhooks are no longer silently acknowledged**:
+  unknown-user returns 503 so Stripe retries (a usually-transient case), while
+  malformed or non-positive metadata is logged and acknowledged.
+- **`grant_credits` only swallows a duplicate `external_id`** as "already
+  processed"; any other integrity error re-raises instead of silently dropping a
+  valid grant.
+
+### Added
+
+- **`balance_after` running-balance** on every ledger row, written in the same
+  transaction, with a database `CHECK (balance_after >= 0)`. `gringotts
+  reconcile` is now a three-way check that a user's cached `credits`, the running
+  `SUM(amount)`, and the latest `balance_after` all agree.
+- **`gringotts migrate`** — forward-only, idempotent, in-place schema upgrades
+  (no recreate); refuses to run if the ledger doesn't already reconcile. And
+  **`gringotts reconcile`** to report any balance/ledger disagreement.
+- **`CHECK (credits >= 0)`** on the `users` table as a database-level backstop.
+- SQLite engine now uses **WAL and a `busy_timeout`** (default 30s,
+  `GRINGOTTS_SQLITE_BUSY_TIMEOUT`) so concurrent writers wait rather than
+  erroring with "database is locked."
+
+### Changed
+
+- `charge()` no longer participates in the host application's database
+  transaction — it owns its own session for the charge and any refund.
+- Docs corrected to the actual toolchain (`pyright`, `uv sync`) and updated for
+  the webhook events, `balance_after`, and `gringotts migrate`.
+
+### Upgrading
+
+- Run `gringotts migrate` to bring an existing database to the new schema (adds
+  `balance_after`); it refuses to run if the ledger doesn't already reconcile.
+- Webhook idempotency now keys on the checkout-session id. Purchases recorded by
+  0.1.x were keyed on the Stripe *event* id and can't be de-duplicated against a
+  later settlement event. **Before upgrading, drain any in-flight delayed (ACH)
+  payments** — a settlement that arrives after the upgrade could otherwise be
+  credited twice. `gringotts migrate` warns when it finds pre-0.2 purchase rows.
+
 ## [0.1.0] - 2026-07-25
 
 First real release. Gringotts is now a packaged library (`pip install

@@ -112,6 +112,10 @@ def build_admin_router(config: GringottsConfig) -> APIRouter:
         admin: User = Depends(require_admin),
         db: Session = Depends(get_session),
     ):
+        if credits < 0:
+            raise HTTPException(
+                status_code=400, detail="Initial credits cannot be negative"
+            )
         if crud.get_user_by_username(db, username) is not None:
             raise HTTPException(status_code=409, detail="Username already exists")
         user, api_key = auth.create_user_with_key(
@@ -143,6 +147,8 @@ def build_admin_router(config: GringottsConfig) -> APIRouter:
         admin: User = Depends(require_admin),
         db: Session = Depends(get_session),
     ):
+        if amount <= 0:
+            raise HTTPException(status_code=400, detail="Grant amount must be positive")
         user = crud.get_user(db, user_id)
         if user is None:
             raise HTTPException(status_code=404, detail="User not found")
