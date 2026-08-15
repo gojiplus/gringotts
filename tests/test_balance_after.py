@@ -55,6 +55,22 @@ def test_reconcile_detects_balance_after_corruption(db_session):
     assert disc[0]["balance_after"] == 999
 
 
+def test_reconcile_detects_middle_row_corruption(db_session):
+    # credits == SUM == latest all stay correct; only a non-latest row is wrong.
+    user, _ = auth.create_user_with_key(db_session, "mid", credits=10)  # ba=10
+    crud.charge_user(db_session, user, 3)  # ba=7
+    crud.charge_user(db_session, user, 2)  # ba=5 (latest)
+    middle = _rows(db_session, user.id)[1]  # the ba=7 row
+    db_session.query(models.CreditTransaction).filter_by(id=middle.id).update(
+        {models.CreditTransaction.balance_after: 999}
+    )
+    db_session.commit()
+    disc = crud.find_balance_discrepancies(db_session)
+    assert len(disc) == 1
+    assert disc[0]["bad_balance_after_rows"] == 1
+    assert disc[0]["cached"] == 5  # cache/sum/latest still agree; chain caught it
+
+
 def test_balance_after_check_constraint_blocks_negative(db_session):
     from sqlalchemy.exc import IntegrityError
 

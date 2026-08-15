@@ -254,56 +254,42 @@ def aggregate_stats(db: Session) -> dict:
 
 
 def find_balance_discrepancies(db: Session) -> list[dict]:
-    """Return users whose balance fails the three-way consistency check.
+    """Return users whose ledger fails the running-balance consistency check.
 
-    For each user the cached `credits`, the running `SUM(amount)`, and the
-    latest row's `balance_after` must all agree. Any mismatch is reported.
-    An empty list means every balance reconciles with its append-only ledger.
+    For each user, walking the append-only ledger oldest-first, every row's
+    `balance_after` must equal the cumulative `SUM(amount)` up to that row, and
+    the final running total must equal the cached `credits`. This validates the
+    whole chain, not just the latest row, so corruption or a NULL in any earlier
+    row is caught. An empty list means every balance reconciles.
     """
-    ledger = func.coalesce(func.sum(models.CreditTransaction.amount), 0)
-    rows = (
-        db.query(models.User, ledger.label("ledger"))
-        .outerjoin(
-            models.CreditTransaction,
-            models.CreditTransaction.user_id == models.User.id,
-        )
-        .group_by(models.User.id)
-        .order_by(models.User.id)
-        .all()
-    )
+    users = db.query(models.User).order_by(models.User.id).all()
     discrepancies = []
-    for user, ledger_sum in rows:
-        latest = (
-            db.query(models.CreditTransaction.balance_after)
+    for user in users:
+        rows = (
+            db.query(models.CreditTransaction)
             .filter(models.CreditTransaction.user_id == user.id)
-            .order_by(models.CreditTransaction.id.desc())
-            .first()
+            .order_by(models.CreditTransaction.id)
+            .all()
         )
-        latest_balance_after = latest[0] if latest is not None else 0
-        # A NULL balance_after (possible only on a migrated SQLite DB, where the
-        # column can't be tightened to NOT NULL) would hide from the latest-row
-        # check if a later valid row exists — so flag any NULL directly.
-        null_count = (
-            db.query(func.count())
-            .filter(
-                models.CreditTransaction.user_id == user.id,
-                models.CreditTransaction.balance_after.is_(None),
-            )
-            .scalar()
-        )
-        if (
-            user.credits != int(ledger_sum)
-            or user.credits != (latest_balance_after or 0)
-            or null_count
-        ):
+        running = 0
+        bad_rows = 0
+        null_rows = 0
+        for row in rows:
+            running += row.amount
+            if row.balance_after is None:
+                null_rows += 1
+            elif row.balance_after != running:
+                bad_rows += 1
+        if user.credits != running or bad_rows or null_rows:
             discrepancies.append(
                 {
                     "id": user.id,
                     "username": user.username,
                     "cached": user.credits,
-                    "ledger": int(ledger_sum),
-                    "balance_after": latest_balance_after,
-                    "null_balance_after_rows": int(null_count or 0),
+                    "ledger": running,
+                    "balance_after": rows[-1].balance_after if rows else 0,
+                    "bad_balance_after_rows": bad_rows,
+                    "null_balance_after_rows": null_rows,
                 }
             )
     return discrepancies
