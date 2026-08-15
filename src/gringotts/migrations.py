@@ -106,6 +106,24 @@ STEPS: list[tuple[int, str, Callable]] = [
 HEAD = STEPS[-1][0] if STEPS else 0
 
 
+def legacy_event_keyed_purchases(engine: Engine) -> int:
+    """Count purchase rows still keyed on a Stripe event id (the pre-0.2 scheme).
+
+    Such rows can't be de-duplicated against post-upgrade settlement events
+    (which carry a different event id and no link back), so a delayed payment
+    mid-settlement across the upgrade could be credited twice.
+    """
+    with engine.connect() as conn:
+        # Stripe event ids start with 'evt_'; checkout session ids with 'cs_'.
+        count = conn.execute(
+            text(
+                "SELECT COUNT(*) FROM credit_transactions "
+                "WHERE kind = 'purchase' AND external_id LIKE 'evt_%'"
+            )
+        ).scalar()
+    return int(count or 0)
+
+
 def run_pending(engine: Engine) -> list[str]:
     """Apply pending migrations in order; return human-readable descriptions.
 

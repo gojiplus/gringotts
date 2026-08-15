@@ -66,6 +66,14 @@ def main(argv: list[str] | None = None) -> None:
         else:
             for line in applied:
                 print(f"Applied {line}")
+        legacy = migrations.legacy_event_keyed_purchases(db.engine)
+        if legacy:
+            print(
+                f"WARNING: {legacy} purchase(s) were recorded under the pre-0.2 "
+                "event-id scheme. Drain any in-flight delayed (ACH) payments "
+                "before relying on webhook idempotency — a settlement arriving "
+                "after this upgrade could be credited twice."
+            )
         return
 
     session = db.SessionLocal()

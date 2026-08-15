@@ -56,6 +56,16 @@ strong-consistency and in-place-upgrade foundation.
 - Docs corrected to the actual toolchain (`pyright`, `uv sync`) and updated for
   the webhook events, `balance_after`, and `gringotts migrate`.
 
+### Upgrading
+
+- Run `gringotts migrate` to bring an existing database to the new schema (adds
+  `balance_after`); it refuses to run if the ledger doesn't already reconcile.
+- Webhook idempotency now keys on the checkout-session id. Purchases recorded by
+  0.1.x were keyed on the Stripe *event* id and can't be de-duplicated against a
+  later settlement event. **Before upgrading, drain any in-flight delayed (ACH)
+  payments** — a settlement that arrives after the upgrade could otherwise be
+  credited twice. `gringotts migrate` warns when it finds pre-0.2 purchase rows.
+
 ## [0.1.0] - 2026-07-25
 
 First real release. Gringotts is now a packaged library (`pip install

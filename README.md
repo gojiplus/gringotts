@@ -226,7 +226,11 @@ gringotts migrate                  # apply pending schema changes to an existing
 
 Upgrading an existing database is `gringotts migrate` (not a recreate): it
 applies forward-only, idempotent schema changes in place, and refuses to run if
-the ledger doesn't already reconcile.
+the ledger doesn't already reconcile. Upgrading from 0.1.x: webhook idempotency
+now keys on the checkout-session id rather than the Stripe event id, so **drain
+any in-flight delayed (ACH) payments before upgrading** — a settlement arriving
+afterward can't be matched to a 0.1-era purchase row and could be credited twice
+(`gringotts migrate` warns when it finds such rows).
 
 ## Not yet (deliberately)
 

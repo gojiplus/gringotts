@@ -125,6 +125,23 @@ def test_reconcile_clean_after_migrate(tmp_path):
         engine.dispose()
 
 
+def test_legacy_event_keyed_purchases_detected(tmp_path):
+    engine = _legacy_db(tmp_path)
+    try:
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    "INSERT INTO credit_transactions "
+                    "(user_id, amount, kind, external_id) VALUES "
+                    "(1, 100, 'purchase', 'evt_legacy'), "
+                    "(1, 50, 'purchase', 'cs_modern')"
+                )
+            )
+        assert migrations.legacy_event_keyed_purchases(engine) == 1  # only evt_ one
+    finally:
+        engine.dispose()
+
+
 def test_fresh_db_migrate_then_noop(tmp_path):
     from gringotts.db import Base
 
