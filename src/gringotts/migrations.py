@@ -67,6 +67,7 @@ def _ledger_drift(conn) -> list[tuple[int, int, int]]:
 
 
 def _add_balance_after(conn) -> None:
+    dialect = conn.engine.dialect.name
     if not _has_column(conn, "credit_transactions", "balance_after"):
         # SQLite (>=3.37) and Postgres both allow an inline CHECK on ADD COLUMN.
         conn.execute(
@@ -86,6 +87,16 @@ def _add_balance_after(conn) -> None:
             ") WHERE balance_after IS NULL"
         )
     )
+    # Match fresh installs' NOT NULL. Postgres can tighten in place after the
+    # backfill; SQLite cannot without a table rebuild, so it stays nullable and
+    # relies on the app layer plus the reconcile NULL check to keep it populated.
+    if dialect == "postgresql":
+        conn.execute(
+            text(
+                "ALTER TABLE credit_transactions "
+                "ALTER COLUMN balance_after SET NOT NULL"
+            )
+        )
 
 
 STEPS: list[tuple[int, str, Callable]] = [
@@ -116,10 +127,3 @@ def run_pending(engine: Engine) -> list[str]:
                 _set_version(conn, target)
                 applied.append(f"v{target}: {description}")
         return applied
-
-
-def stamp_head(engine: Engine) -> None:
-    """Mark a freshly created (create_all) database as fully migrated."""
-    with engine.begin() as conn:
-        _ensure_version_row(conn)
-        _set_version(conn, HEAD)

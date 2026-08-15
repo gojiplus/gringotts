@@ -52,7 +52,10 @@ def main(argv: list[str] | None = None) -> None:
 
     if args.cmd == "init-db":
         db.Base.metadata.create_all(bind=db.engine)
-        migrations.stamp_head(db.engine)  # fresh DB is already at head
+        # Bring the schema to head. On a fresh DB this is a no-op that stamps the
+        # version; on an existing DB it applies pending migrations rather than
+        # falsely marking an out-of-date schema as current.
+        migrations.run_pending(db.engine)
         print("Database tables created")
         return
 

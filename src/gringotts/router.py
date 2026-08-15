@@ -253,6 +253,16 @@ def build_router(config: GringottsConfig) -> APIRouter:
                 raise HTTPException(
                     status_code=503, detail="User not found; retry later"
                 )
+            # Databases created before 0.2.0 keyed purchases on the Stripe
+            # event id. If this event was already credited under that scheme,
+            # skip it — otherwise re-keying on the session id would double-credit
+            # a payment when Stripe retries across the upgrade boundary.
+            if crud.external_id_exists(db, event["id"]):
+                logger.info(
+                    "gringotts webhook: event %s already credited (legacy key)",
+                    event["id"],
+                )
+                return {"received": True}
             # Idempotency is keyed on the checkout session, not the event id:
             # Stripe may emit several event objects for one session.
             granted = crud.grant_credits(

@@ -158,14 +158,14 @@ def grant_credits(
         # Only a duplicate external_id means "already processed" (idempotent
         # replay). Any other integrity failure is a real error we must not
         # swallow, or a valid grant would vanish silently.
-        if external_id is not None and _external_id_exists(db, external_id):
+        if external_id is not None and external_id_exists(db, external_id):
             return False
         raise
     db.refresh(user)
     return True
 
 
-def _external_id_exists(db: Session, external_id: str) -> bool:
+def external_id_exists(db: Session, external_id: str) -> bool:
     """Whether a ledger row already carries this external id."""
     return (
         db.query(models.CreditTransaction.id)
@@ -280,7 +280,22 @@ def find_balance_discrepancies(db: Session) -> list[dict]:
             .first()
         )
         latest_balance_after = latest[0] if latest is not None else 0
-        if user.credits != int(ledger_sum) or user.credits != latest_balance_after:
+        # A NULL balance_after (possible only on a migrated SQLite DB, where the
+        # column can't be tightened to NOT NULL) would hide from the latest-row
+        # check if a later valid row exists — so flag any NULL directly.
+        null_count = (
+            db.query(func.count())
+            .filter(
+                models.CreditTransaction.user_id == user.id,
+                models.CreditTransaction.balance_after.is_(None),
+            )
+            .scalar()
+        )
+        if (
+            user.credits != int(ledger_sum)
+            or user.credits != (latest_balance_after or 0)
+            or null_count
+        ):
             discrepancies.append(
                 {
                     "id": user.id,
@@ -288,6 +303,7 @@ def find_balance_discrepancies(db: Session) -> list[dict]:
                     "cached": user.credits,
                     "ledger": int(ledger_sum),
                     "balance_after": latest_balance_after,
+                    "null_balance_after_rows": int(null_count or 0),
                 }
             )
     return discrepancies

@@ -310,6 +310,66 @@ def test_c7_grant_reraises_non_duplicate_integrity_error(db_session, monkeypatch
         crud.grant_credits(db_session, user, 50, external_id="brand_new_id")
 
 
+# ---- review: client disconnect (CancelledError) must refund ----------------
+def test_cancellederror_refunds_but_normal_close_does_not(db_session):
+    import asyncio
+    from types import SimpleNamespace
+
+    user, key = auth.create_user_with_key(db_session, "cx", credits=10)
+
+    def refunds():
+        return (
+            db_session.query(models.CreditTransaction)
+            .filter_by(user_id=user.id, kind="refund")
+            .count()
+        )
+
+    def req():
+        return SimpleNamespace(
+            headers={"X-API-Key": key}, url=SimpleNamespace(path="/x")
+        )
+
+    dep = charge(3)
+    gen = dep(req())
+    next(gen)  # charges, yields
+    with pytest.raises(asyncio.CancelledError):
+        gen.throw(asyncio.CancelledError())
+    assert refunds() == 1  # client disconnect refunded
+
+    gen2 = dep(req())
+    next(gen2)
+    gen2.close()  # GeneratorExit on normal close
+    assert refunds() == 1  # no spurious refund
+
+
+# ---- review: no double-credit across the pre-0.2 upgrade boundary ----------
+def test_legacy_event_id_purchase_not_double_credited(db_session):
+    # simulate a v0.1 purchase row keyed on the Stripe event id
+    user, _ = auth.create_user_with_key(db_session, "legacy", credits=0)
+    db_session.add(
+        models.CreditTransaction(
+            user_id=user.id,
+            amount=100,
+            kind="purchase",
+            external_id="evt_legacy",  # old scheme: event id, not session id
+            balance_after=100,
+        )
+    )
+    db_session.query(models.User).filter_by(id=user.id).update(
+        {models.User.credits: 100}
+    )
+    db_session.commit()
+    # Stripe re-delivers the same event after upgrade; new code keys on session id
+    payload = _event(user.id, 100, "evt_legacy", "cs_new")
+    assert _post(TestClient(make_stripe_app()), payload).status_code == 200
+    db_session.refresh(user)
+    assert user.credits == 100  # not double-credited
+    assert (
+        db_session.query(models.CreditTransaction).filter_by(kind="purchase").count()
+        == 1
+    )
+
+
 # ---- reconciliation precaution ---------------------------------------------
 def test_reconcile_detects_divergence(db_session):
     user, _ = auth.create_user_with_key(db_session, "r", credits=10)

@@ -1,5 +1,7 @@
 """FastAPI dependencies: authentication, admin gating, and the charge() core."""
 
+import asyncio
+import logging
 from collections.abc import Callable, Iterator
 
 from fastapi import Depends, HTTPException, Request
@@ -9,6 +11,8 @@ from . import crud, db
 from .db import get_session
 from .exceptions import InvalidAPIKeyError, PaymentRequiredError
 from .models import User
+
+logger = logging.getLogger(__name__)
 
 CreditedUser = User
 
@@ -65,7 +69,12 @@ def charge(cost: CostSpec) -> Callable[..., Iterator[User]]:
             user_id = user.id
             try:
                 yield user
-            except Exception:
+            except (Exception, asyncio.CancelledError):
+                # Refund on any abnormal exit, including a client disconnect
+                # (CancelledError is a BaseException, so `except Exception`
+                # alone would let it consume credits for undelivered work).
+                # GeneratorExit is deliberately not caught: it fires on normal
+                # close and must not trigger a refund.
                 _refund_on_fresh_session(user_id, amount, endpoint)
                 raise
         finally:
@@ -86,5 +95,8 @@ def _refund_on_fresh_session(user_id: int, amount: int, endpoint: str) -> None:
         user = crud.get_user(session, user_id)
         if user is not None:
             crud.refund_user(session, user, amount, endpoint=endpoint)
+    except Exception:
+        # Best-effort: never let a failed refund mask the original exception.
+        logger.exception("gringotts: refund failed for user %s", user_id)
     finally:
         session.close()
