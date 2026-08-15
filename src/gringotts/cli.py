@@ -2,7 +2,13 @@
 
 import argparse
 
-from . import auth, crud, db, models  # noqa: F401  (models import registers tables)
+from . import (  # noqa: F401  (models import registers tables)
+    auth,
+    crud,
+    db,
+    migrations,
+    models,
+)
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -34,11 +40,29 @@ def main(argv: list[str] | None = None) -> None:
     p_balance = sub.add_parser("balance", help="Show a user's balance")
     p_balance.add_argument("username")
 
+    sub.add_parser(
+        "reconcile", help="Report any user whose balance disagrees with the ledger"
+    )
+
+    sub.add_parser(
+        "migrate", help="Apply pending schema migrations to an existing database"
+    )
+
     args = parser.parse_args(argv)
 
     if args.cmd == "init-db":
         db.Base.metadata.create_all(bind=db.engine)
+        migrations.stamp_head(db.engine)  # fresh DB is already at head
         print("Database tables created")
+        return
+
+    if args.cmd == "migrate":
+        applied = migrations.run_pending(db.engine)
+        if not applied:
+            print("Database schema is up to date")
+        else:
+            for line in applied:
+                print(f"Applied {line}")
         return
 
     session = db.SessionLocal()
@@ -58,11 +82,24 @@ def main(argv: list[str] | None = None) -> None:
             state = "no longer" if args.revoke else "now"
             print(f"User {user.username} is {state} an admin")
         elif args.cmd == "add-credits":
+            if args.credits <= 0:
+                raise SystemExit("credits to add must be positive")
             user = crud.get_user_by_username(session, args.username)
             if user is None:
                 raise SystemExit(f"User {args.username} not found")
             crud.grant_credits(session, user, args.credits)
             print(f"User {user.username} now has {user.credits} credits")
+        elif args.cmd == "reconcile":
+            discrepancies = crud.find_balance_discrepancies(session)
+            if not discrepancies:
+                print("All balances reconcile with the ledger")
+            else:
+                for d in discrepancies:
+                    print(
+                        f"MISMATCH user {d['username']} (id={d['id']}): "
+                        f"balance={d['cached']} ledger={d['ledger']}"
+                    )
+                raise SystemExit(f"{len(discrepancies)} balance(s) do not reconcile")
         elif args.cmd == "balance":
             user = crud.get_user_by_username(session, args.username)
             if user is None:

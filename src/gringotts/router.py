@@ -1,6 +1,7 @@
 """User-facing routes: balance, usage, account page, purchase flow, webhook."""
 
 import html
+import logging
 from importlib.resources import files
 
 import stripe
@@ -12,6 +13,17 @@ from . import billing, crud, pages
 from .config import GringottsConfig
 from .db import get_session
 from .dependencies import API_KEY_HEADER, authenticate
+
+logger = logging.getLogger(__name__)
+
+# checkout.session.completed can fire before a delayed payment (ACH, etc.)
+# settles; async_payment_succeeded is the settlement event. Both carry the
+# session with metadata, so we handle both and gate on payment_status.
+_FULFILL_EVENTS = {
+    "checkout.session.completed",
+    "checkout.session.async_payment_succeeded",
+}
+_PAID_STATUSES = {"paid", "no_payment_required"}
 
 _BUY_PAGE = """<!doctype html>
 <html>
@@ -185,27 +197,76 @@ def build_router(config: GringottsConfig) -> APIRouter:
                 status_code=400, detail="Invalid webhook signature"
             ) from err
 
-        if event["type"] == "checkout.session.completed":
+        if event["type"] in _FULFILL_EVENTS:
+            session = event["data"]["object"]
             # stripe's typed objects raise KeyError (not .get) on missing keys
             try:
-                metadata = event["data"]["object"]["metadata"]
+                metadata = session["metadata"]
                 user_id = int(metadata["gringotts_user_id"])
                 credits = int(metadata["credits"])
+                session_id = session["id"]
             except (KeyError, TypeError, ValueError):
+                logger.error(
+                    "gringotts webhook %s: missing/invalid metadata; "
+                    "payment cannot be credited",
+                    event["id"],
+                )
+                return {"received": True}
+            if credits <= 0:
+                # Our own checkout only ever sets a positive pack size, so a
+                # non-positive value is a corrupt/forged event: log and ack
+                # (do not let it reach grant_credits and 500 into a retry storm).
+                logger.error(
+                    "gringotts webhook %s: non-positive credits=%s in metadata; "
+                    "ignoring",
+                    event["id"],
+                    credits,
+                )
                 return {"received": True}
             try:
-                amount_cents = int(event["data"]["object"]["amount_total"])
+                payment_status = session["payment_status"]
+            except (KeyError, TypeError):
+                payment_status = None
+            if payment_status not in _PAID_STATUSES:
+                # Not settled yet; wait for async_payment_succeeded.
+                logger.info(
+                    "gringotts webhook %s: payment_status=%s, deferring credit",
+                    event["id"],
+                    payment_status,
+                )
+                return {"received": True}
+            try:
+                amount_cents = int(session["amount_total"])
             except (KeyError, TypeError, ValueError):
                 amount_cents = None
             user = crud.get_user(db, user_id)
-            if user is not None:
-                crud.grant_credits(
-                    db,
-                    user,
-                    credits,
-                    kind="purchase",
-                    external_id=event["id"],
-                    amount_cents=amount_cents,
+            if user is None:
+                # Usually transient (the user existed when checkout was created;
+                # replica lag or a restore in flight). Return non-2xx so Stripe
+                # retries — after its retry window a genuine deletion surfaces in
+                # the dashboard instead of silently dropping the payment.
+                logger.error(
+                    "gringotts webhook %s: user %s not found; asking Stripe to retry",
+                    event["id"],
+                    user_id,
+                )
+                raise HTTPException(
+                    status_code=503, detail="User not found; retry later"
+                )
+            # Idempotency is keyed on the checkout session, not the event id:
+            # Stripe may emit several event objects for one session.
+            granted = crud.grant_credits(
+                db,
+                user,
+                credits,
+                kind="purchase",
+                external_id=session_id,
+                amount_cents=amount_cents,
+            )
+            if not granted:
+                logger.info(
+                    "gringotts webhook: checkout session %s already credited",
+                    session_id,
                 )
         return {"received": True}
 

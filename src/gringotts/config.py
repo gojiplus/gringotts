@@ -13,6 +13,13 @@ class CreditPack:
     name: str
     currency: str = "usd"
 
+    def __post_init__(self) -> None:
+        """Reject packs that would charge for nothing or subtract credits."""
+        if self.credits <= 0:
+            raise ValueError("CreditPack.credits must be positive")
+        if self.price_cents < 0:
+            raise ValueError("CreditPack.price_cents cannot be negative")
+
 
 @dataclass
 class GringottsConfig:
