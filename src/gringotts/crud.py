@@ -476,6 +476,25 @@ def find_balance_discrepancies(db: Session) -> list[dict]:
     return discrepancies
 
 
+def purge_idempotency_records(db: Session, older_than_seconds: float) -> int:
+    """Delete idempotency records older than `older_than_seconds`; return the count.
+
+    Response caching stores a row per keyed request; this reclaims space and clears
+    stuck in-flight records. The middleware also expires records lazily on reuse,
+    so this is for records that are simply never retried.
+    """
+    from datetime import UTC, datetime, timedelta
+
+    cutoff = datetime.now(UTC) - timedelta(seconds=older_than_seconds)
+    deleted = (
+        db.query(models.IdempotencyRecord)
+        .filter(models.IdempotencyRecord.created_at < cutoff)
+        .delete(synchronize_session=False)
+    )
+    db.commit()
+    return int(deleted)
+
+
 def set_admin(db: Session, user: models.User, is_admin: bool) -> models.User:
     """Grant or revoke the user's admin flag."""
     user.is_admin = is_admin

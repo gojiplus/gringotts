@@ -48,6 +48,16 @@ def main(argv: list[str] | None = None) -> None:
         "migrate", help="Apply pending schema migrations to an existing database"
     )
 
+    p_prune = sub.add_parser(
+        "prune-idempotency", help="Delete stored idempotency records past their age"
+    )
+    p_prune.add_argument(
+        "--older-than-seconds",
+        type=float,
+        default=86_400.0,
+        help="Delete records older than this (default 86400 = 24h)",
+    )
+
     args = parser.parse_args(argv)
 
     if args.cmd == "init-db":
@@ -112,6 +122,9 @@ def main(argv: list[str] | None = None) -> None:
                         f"balance={d['cached']} ledger={d['ledger']}"
                     )
                 raise SystemExit(f"{len(discrepancies)} balance(s) do not reconcile")
+        elif args.cmd == "prune-idempotency":
+            deleted = crud.purge_idempotency_records(session, args.older_than_seconds)
+            print(f"Deleted {deleted} idempotency record(s)")
         elif args.cmd == "balance":
             user = crud.get_user_by_username(session, args.username)
             if user is None:

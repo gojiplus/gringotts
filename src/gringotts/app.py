@@ -43,7 +43,9 @@ def init_app(app: FastAPI, config: GringottsConfig | None = None) -> None:
             IdempotencyMiddleware,
             header=cfg.idempotency_header,
             max_key_length=cfg.idempotency_max_key_length,
-            in_progress_ttl=cfg.idempotency_in_progress_ttl,
+            max_body_bytes=cfg.idempotency_max_body_bytes,
+            max_response_bytes=cfg.idempotency_max_response_bytes,
+            retention_seconds=cfg.idempotency_retention_seconds,
         )
 
     async def handle_payment_required(request: Request, exc: PaymentRequiredError):

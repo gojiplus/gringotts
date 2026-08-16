@@ -93,8 +93,13 @@ class GringottsConfig:
             ``"Idempotency-Key"``).
         idempotency_max_key_length: Reject a key longer than this with ``400``
             (default ``255``).
-        idempotency_in_progress_ttl: Seconds after which an in-flight record whose
-            owner appears to have crashed becomes reclaimable (default ``90``).
+        idempotency_max_body_bytes: A keyed request whose body exceeds this is
+            passed through uncached rather than buffered (default ``1_000_000``).
+        idempotency_max_response_bytes: A response larger than this is streamed to
+            the client but not cached (default ``1_000_000``).
+        idempotency_retention_seconds: A stored record older than this is treated
+            as expired — a reused key re-runs, bounding both table growth and how
+            long a replay can outlive a revoked credential (default ``86_400``).
     """
 
     packs: list[CreditPack] = field(default_factory=list)
@@ -106,7 +111,9 @@ class GringottsConfig:
     idempotency_enabled: bool = True
     idempotency_header: str = "Idempotency-Key"
     idempotency_max_key_length: int = 255
-    idempotency_in_progress_ttl: float = 90.0
+    idempotency_max_body_bytes: int = 1_000_000
+    idempotency_max_response_bytes: int = 1_000_000
+    idempotency_retention_seconds: float = 86_400.0
 
     def __post_init__(self) -> None:
         """Fill Stripe credentials from env and require one currency across packs."""

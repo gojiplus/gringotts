@@ -6,15 +6,16 @@ request with the same key from the same caller gets that stored response back
 without re-running the handler.
 """
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 
-from fastapi import Depends, FastAPI
+from fastapi import Depends, FastAPI, Response
 from fastapi.testclient import TestClient
 from test_charge import make_app
 
 import gringotts
 from gringotts import CreditedUser, GringottsConfig, auth, charge, crud, models
-from gringotts.idempotency import _fingerprint
+from gringotts.idempotency import IdempotencyMiddleware, _fingerprint
 
 
 def test_replay_returns_cached_response_and_charges_once(db_session):
@@ -213,8 +214,9 @@ def test_in_progress_request_conflicts(db_session):
     assert user.credits == 10  # not charged while the first is in flight
 
 
-def test_stale_in_progress_is_reclaimed(db_session):
-    # an in-flight record whose owner crashed (older than the TTL) is reclaimable
+def test_in_progress_is_never_reclaimed_by_age(db_session):
+    # an old in-flight record (owner may have crashed after charging) must NOT be
+    # auto-rerun — its outcome is unknown, so a retry stays a 409
     user, key = auth.create_user_with_key(db_session, "st", credits=10)
     db_session.add(
         models.IdempotencyRecord(
@@ -222,15 +224,159 @@ def test_stale_in_progress_is_reclaimed(db_session):
             idempotency_key="stk",
             request_fingerprint=_fingerprint("GET", "/hello", b"", b""),
             completed=False,
-            created_at=datetime.now(UTC) - timedelta(seconds=200),
+            created_at=datetime.now(UTC) - timedelta(days=2),
         )
     )
     db_session.commit()
     client = TestClient(make_app())
     r = client.get("/hello", headers={"X-API-Key": key, "Idempotency-Key": "stk"})
-    assert r.status_code == 200  # reclaimed and ran
+    assert r.status_code == 409  # ambiguous in-flight op, not re-run
     db_session.refresh(user)
-    assert user.credits == 8  # charged
+    assert user.credits == 10  # not charged
+
+
+def test_invalid_key_creates_no_record(db_session):
+    # an unauthenticated caller must not be able to fill idempotency_records
+    client = TestClient(make_app())
+    r = client.get("/hello", headers={"X-API-Key": "gk_bogus", "Idempotency-Key": "z"})
+    assert r.status_code == 401
+    assert db_session.query(models.IdempotencyRecord).count() == 0
+
+
+def test_replay_preserves_response_headers(db_session):
+    app = FastAPI()
+    gringotts.init_app(app, GringottsConfig())
+
+    @app.get("/h")
+    def h(response: Response, user: CreditedUser = Depends(charge(1))):
+        response.headers["X-Custom"] = "kept"
+        return {"ok": True}
+
+    _, key = auth.create_user_with_key(db_session, "hd", credits=10)
+    client = TestClient(app)
+    hd = {"X-API-Key": key, "Idempotency-Key": "hk"}
+    r1 = client.get("/h", headers=hd)
+    r2 = client.get("/h", headers=hd)
+    assert r1.headers.get("X-Custom") == "kept"
+    assert r2.headers.get("X-Custom") == "kept"  # header replayed, not just body
+    assert r2.headers.get("idempotent-replayed") == "true"
+
+
+def test_expired_record_reruns(db_session):
+    app = FastAPI()
+    gringotts.init_app(app, GringottsConfig(idempotency_retention_seconds=0))
+
+    @app.get("/e")
+    def e(user: CreditedUser = Depends(charge(2))):
+        return {"c": user.credits}
+
+    user, key = auth.create_user_with_key(db_session, "ex", credits=10)
+    client = TestClient(app)
+    h = {"X-API-Key": key, "Idempotency-Key": "ek"}
+    client.get("/e", headers=h)
+    client.get("/e", headers=h)  # prior record already expired -> re-runs
+    db_session.refresh(user)
+    assert user.credits == 6  # both charged; the cached row expired
+
+
+def test_response_over_cap_is_not_cached(db_session):
+    app = FastAPI()
+    gringotts.init_app(app, GringottsConfig(idempotency_max_response_bytes=10))
+
+    @app.get("/big")
+    def big(user: CreditedUser = Depends(charge(2))):
+        return {"data": "x" * 100}  # far over the 10-byte cap
+
+    user, key = auth.create_user_with_key(db_session, "bg", credits=10)
+    client = TestClient(app)
+    h = {"X-API-Key": key, "Idempotency-Key": "bk"}
+    client.get("/big", headers=h)
+    client.get("/big", headers=h)  # too big to cache -> re-runs
+    db_session.refresh(user)
+    assert user.credits == 6  # both charged
+
+
+def test_body_over_cap_passes_through_uncached(db_session):
+    app = FastAPI()
+    gringotts.init_app(app, GringottsConfig(idempotency_max_body_bytes=10))
+
+    @app.post("/up")
+    def up(user: CreditedUser = Depends(charge(2))):
+        return {"ok": True}
+
+    user, key = auth.create_user_with_key(db_session, "up", credits=10)
+    client = TestClient(app)
+    h = {"X-API-Key": key, "Idempotency-Key": "uk"}
+    client.post("/up", headers=h, content=b"x" * 100)
+    client.post("/up", headers=h, content=b"x" * 100)  # oversized -> uncached
+    db_session.refresh(user)
+    assert user.credits == 6  # both charged
+    assert db_session.query(models.IdempotencyRecord).count() == 0
+
+
+def test_read_body_detects_disconnect():
+    mw = IdempotencyMiddleware(None)
+    messages = iter(
+        [
+            {"type": "http.request", "body": b"partial", "more_body": True},
+            {"type": "http.disconnect"},
+        ]
+    )
+
+    async def receive():
+        return next(messages)
+
+    body, state, _ = asyncio.run(mw._read_body(receive))
+    assert state == "disconnect"
+    assert body == b"partial"
+
+
+def test_read_body_overflow_replays_buffered():
+    mw = IdempotencyMiddleware(None, max_body_bytes=4)
+    messages = iter(
+        [
+            {"type": "http.request", "body": b"12345", "more_body": True},
+            {"type": "http.request", "body": b"678", "more_body": False},
+        ]
+    )
+
+    async def receive():
+        return next(messages)
+
+    body, state, tail = asyncio.run(mw._read_body(receive))
+    assert state == "overflow"
+    assert body == b"12345"
+    first = asyncio.run(tail())  # tail replays the buffered bytes...
+    assert first["body"] == b"12345"
+    assert first["more_body"] is True
+    rest = asyncio.run(tail())  # ...then delegates to the original receive
+    assert rest["body"] == b"678"
+
+
+def test_prune_idempotency_records(db_session):
+    from datetime import UTC, datetime, timedelta
+
+    db_session.add(
+        models.IdempotencyRecord(
+            api_key_hash="h",
+            idempotency_key="old",
+            request_fingerprint="f",
+            completed=True,
+            created_at=datetime.now(UTC) - timedelta(days=2),
+        )
+    )
+    db_session.add(
+        models.IdempotencyRecord(
+            api_key_hash="h",
+            idempotency_key="new",
+            request_fingerprint="f",
+            completed=True,
+        )
+    )
+    db_session.commit()
+    deleted = crud.purge_idempotency_records(db_session, older_than_seconds=86_400)
+    assert deleted == 1  # only the 2-day-old record
+    assert db_session.query(models.IdempotencyRecord).count() == 1
 
 
 def test_reconcile_clean_after_idempotent_ops(db_session):

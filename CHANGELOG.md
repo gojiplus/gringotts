@@ -23,12 +23,20 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   - A **5xx or unhandled error is not cached** — it's transient, so the key is
     released and a genuine retry re-attempts. A `4xx` (including a `402` for
     insufficient credits) *is* cached; use a fresh key for a fresh attempt.
-  - A crashed in-flight request holds the key (concurrent duplicates get `409`) and
-    becomes reclaimable after `idempotency_in_progress_ttl`, so a crash can't lock a
-    key forever.
+  - Only **authenticated callers** create records (an invalid key can't fill the
+    table); records are **bounded** (oversized request bodies and responses stream
+    through uncached) and **expire** after `idempotency_retention_seconds`.
+  - An **in-flight or crashed** request is never auto-re-run — a duplicate or a
+    retry of an unknown outcome gets `409`, because age can't prove the first
+    attempt didn't already charge. `gringotts prune-idempotency` clears old records.
   - Configurable via `GringottsConfig`: `idempotency_enabled` (default on),
-    `idempotency_header`, `idempotency_max_key_length`, `idempotency_in_progress_ttl`.
+    `idempotency_header`, `idempotency_max_key_length`, `idempotency_max_body_bytes`,
+    `idempotency_max_response_bytes`, `idempotency_retention_seconds`.
   - Backed by a new `idempotency_records` table (applied by `gringotts migrate`).
+  - Known limitation: a replay returns the stored response without re-checking
+    authorization, so a credential revoked mid-window can still replay its own prior
+    responses until they expire. Lower `idempotency_retention_seconds` to shrink the
+    window.
 - Curated documentation site: a grouped API reference, documented config fields,
   usage examples, and new guides (Quickstart, How it works, Stripe & webhooks,
   Examples).

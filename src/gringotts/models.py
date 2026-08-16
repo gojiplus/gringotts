@@ -110,7 +110,9 @@ class IdempotencyRecord(Base):
     completed: Mapped[bool] = mapped_column(default=False)
     status_code: Mapped[int | None] = mapped_column(default=None)
     response_body: Mapped[bytes | None] = mapped_column(LargeBinary, default=None)
-    response_media_type: Mapped[str | None] = mapped_column(String, default=None)
+    # the captured response headers, JSON list of [name, value] latin-1 strings,
+    # so a replay reproduces Location / Set-Cookie / HX-Trigger etc. verbatim
+    response_headers: Mapped[str | None] = mapped_column(String, default=None)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(UTC)
     )
