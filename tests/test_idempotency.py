@@ -279,7 +279,7 @@ def test_expired_record_reruns(db_session):
     assert user.credits == 6  # both charged; the cached row expired
 
 
-def test_response_over_cap_is_not_cached(db_session):
+def test_response_over_cap_keeps_lock_and_charges_once(db_session):
     app = FastAPI()
     gringotts.init_app(app, GringottsConfig(idempotency_max_response_bytes=10))
 
@@ -290,28 +290,98 @@ def test_response_over_cap_is_not_cached(db_session):
     user, key = auth.create_user_with_key(db_session, "bg", credits=10)
     client = TestClient(app)
     h = {"X-API-Key": key, "Idempotency-Key": "bk"}
-    client.get("/big", headers=h)
-    client.get("/big", headers=h)  # too big to cache -> re-runs
+    r1 = client.get("/big", headers=h)
+    assert r1.json()["data"] == "x" * 100  # first request gets the full response
+    r2 = client.get("/big", headers=h)  # replay: lock kept, handler NOT re-run
+    assert r2.headers.get("idempotent-response-truncated") == "true"
     db_session.refresh(user)
-    assert user.credits == 6  # both charged
+    assert user.credits == 8  # charged once; the oversized response didn't free the key
 
 
-def test_body_over_cap_passes_through_uncached(db_session):
+def test_body_over_cap_is_rejected_not_run(db_session):
     app = FastAPI()
     gringotts.init_app(app, GringottsConfig(idempotency_max_body_bytes=10))
 
+    ran = {"n": 0}
+
     @app.post("/up")
     def up(user: CreditedUser = Depends(charge(2))):
+        ran["n"] += 1
         return {"ok": True}
 
     user, key = auth.create_user_with_key(db_session, "up", credits=10)
     client = TestClient(app)
     h = {"X-API-Key": key, "Idempotency-Key": "uk"}
-    client.post("/up", headers=h, content=b"x" * 100)
-    client.post("/up", headers=h, content=b"x" * 100)  # oversized -> uncached
+    r = client.post("/up", headers=h, content=b"x" * 100)  # oversized keyed body
+    assert r.status_code == 413  # rejected before any side effect
     db_session.refresh(user)
-    assert user.credits == 6  # both charged
+    assert user.credits == 10  # not charged
+    assert ran["n"] == 0  # handler never ran
     assert db_session.query(models.IdempotencyRecord).count() == 0
+
+
+def test_disconnect_mid_upload_runs_nothing(db_session):
+    # a truncated (disconnected) keyed request must not run the wrapped app, so it
+    # can never charge and then be retried into a double charge
+    _, key = auth.create_user_with_key(db_session, "dc", credits=10)
+    called = {"v": False}
+
+    async def dummy_app(scope, receive, send):
+        called["v"] = True
+
+    mw = IdempotencyMiddleware(dummy_app)
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "path": "/up",
+        "query_string": b"",
+        "headers": [(b"x-api-key", key.encode()), (b"idempotency-key", b"dk")],
+    }
+    messages = iter(
+        [
+            {"type": "http.request", "body": b"partial", "more_body": True},
+            {"type": "http.disconnect"},
+        ]
+    )
+
+    async def receive():
+        return next(messages)
+
+    sent = []
+
+    async def send(message):
+        sent.append(message)
+
+    asyncio.run(mw(scope, receive, send))
+    assert called["v"] is False  # app never invoked on the aborted upload
+    assert sent == []  # nothing sent for a client that's already gone
+    assert db_session.query(models.IdempotencyRecord).count() == 0
+
+
+def test_returned_5xx_is_cached_and_charges_once(db_session):
+    # a handler that RETURNS a 5xx after charging committed the charge, so a retry
+    # must get the cached 5xx, not run (and charge) again
+    from fastapi.responses import JSONResponse
+
+    app = FastAPI()
+    gringotts.init_app(app, GringottsConfig())
+    ran = {"n": 0}
+
+    @app.get("/ret5xx")
+    def ret5xx(user: CreditedUser = Depends(charge(2))):
+        ran["n"] += 1
+        return JSONResponse({"detail": "downstream failed"}, status_code=503)
+
+    user, key = auth.create_user_with_key(db_session, "r5", credits=10)
+    client = TestClient(app)
+    h = {"X-API-Key": key, "Idempotency-Key": "r5k"}
+    assert client.get("/ret5xx", headers=h).status_code == 503
+    r2 = client.get("/ret5xx", headers=h)
+    assert r2.status_code == 503  # replayed, not re-run
+    assert r2.headers.get("idempotent-replayed") == "true"
+    assert ran["n"] == 1  # handler ran once
+    db_session.refresh(user)
+    assert user.credits == 8  # charged once
 
 
 def test_read_body_detects_disconnect():
@@ -326,31 +396,53 @@ def test_read_body_detects_disconnect():
     async def receive():
         return next(messages)
 
-    body, state, _ = asyncio.run(mw._read_body(receive))
+    body, state = asyncio.run(mw._read_body(receive))
     assert state == "disconnect"
     assert body == b"partial"
 
 
-def test_read_body_overflow_replays_buffered():
+def test_read_body_flags_overflow():
     mw = IdempotencyMiddleware(None, max_body_bytes=4)
     messages = iter(
         [
             {"type": "http.request", "body": b"12345", "more_body": True},
-            {"type": "http.request", "body": b"678", "more_body": False},
         ]
     )
 
     async def receive():
         return next(messages)
 
-    body, state, tail = asyncio.run(mw._read_body(receive))
+    body, state = asyncio.run(mw._read_body(receive))
     assert state == "overflow"
     assert body == b"12345"
-    first = asyncio.run(tail())  # tail replays the buffered bytes...
-    assert first["body"] == b"12345"
-    assert first["more_body"] is True
-    rest = asyncio.run(tail())  # ...then delegates to the original receive
-    assert rest["body"] == b"678"
+
+
+def test_streaming_response_is_cached_without_hang(db_session):
+    # exercises the replay_receive path: a StreamingResponse makes Starlette poll
+    # receive for disconnect, so replaying the terminal message forever would hang
+    from fastapi.responses import StreamingResponse
+
+    app = FastAPI()
+    gringotts.init_app(app, GringottsConfig())
+
+    @app.get("/stream")
+    def stream(user: CreditedUser = Depends(charge(2))):
+        def gen():
+            yield b"chunk1"
+            yield b"chunk2"
+
+        return StreamingResponse(gen(), media_type="text/plain")
+
+    user, key = auth.create_user_with_key(db_session, "sm", credits=10)
+    client = TestClient(app)
+    h = {"X-API-Key": key, "Idempotency-Key": "sk"}
+    r1 = client.get("/stream", headers=h)
+    assert r1.content == b"chunk1chunk2"
+    r2 = client.get("/stream", headers=h)
+    assert r2.content == b"chunk1chunk2"  # replayed intact
+    assert r2.headers.get("idempotent-replayed") == "true"
+    db_session.refresh(user)
+    assert user.credits == 8  # charged once
 
 
 def test_prune_idempotency_records(db_session):

@@ -22,10 +22,12 @@ Design choices (documented, not incidental):
 - **A fingerprint** (method + path + query + body) guards the key: reusing it for
   a materially different request returns ``409`` rather than the wrong cached
   response.
-- **5xx responses and unhandled exceptions are not cached** — they are transient,
-  so the key is released and a genuine retry re-attempts. 4xx (including a ``402``
-  for insufficient credits) *is* cached: it is a deterministic result of that
-  request, and a caller who wants a fresh attempt uses a fresh key.
+- **A raised exception releases the key; a returned response is cached.** gringotts
+  charges *before* the handler runs, and ``Depends(charge())`` refunds on a raised
+  exception — so a handler that raises is treated as rolled back and a genuine retry
+  re-attempts, while any response the handler *returns* (2xx, 4xx, even a 5xx it
+  returns itself) leaves the charge committed and is cached, so a retry can't run it
+  again. A caller who wants a fresh attempt uses a fresh key.
 - **An in-flight or crashed request is never re-run automatically.** A concurrent
   duplicate, and any retry of a request whose outcome is unknown, gets ``409`` —
   because age alone can't prove the first attempt didn't already charge. Records
@@ -59,6 +61,18 @@ _IN_PROGRESS_BODY = json.dumps(
     {"detail": "A request with this Idempotency-Key is still in progress"}
 ).encode()
 _KEY_TOO_LONG_BODY = json.dumps({"detail": "Idempotency-Key is too long"}).encode()
+_BODY_TOO_LARGE_BODY = json.dumps(
+    {"detail": "Request body too large for an idempotent request"}
+).encode()
+# Stored for a request whose response was too large to cache: the charge already
+# happened once, so a replay must return this (keeping the key locked) rather than
+# re-running the handler.
+_TRUNCATED_BODY = json.dumps(
+    {"detail": "The request was processed; its response was too large to cache."}
+).encode()
+_TRUNCATED_HEADERS = json.dumps(
+    [["content-type", "application/json"], ["idempotent-response-truncated", "true"]]
+)
 
 
 def _fingerprint(method: str, path: str, query: bytes, body: bytes) -> str:
@@ -107,9 +121,17 @@ class IdempotencyMiddleware:
             await self.app(scope, receive, send)
             return
 
-        headers = dict(scope["headers"])
-        raw_key = headers.get(self.header)
-        raw_api_key = headers.get(self.api_key_header)
+        # Take the FIRST occurrence of each header, matching what FastAPI's
+        # request.headers.get() authenticates on — dict() would pick the last, so
+        # a duplicated X-API-Key could scope under a different caller than the one
+        # the handler charges.
+        raw_key = raw_api_key = None
+        for name, value in scope["headers"]:
+            lname = name.lower()
+            if lname == self.header and raw_key is None:
+                raw_key = value
+            elif lname == self.api_key_header and raw_api_key is None:
+                raw_api_key = value
         # No key, or no caller to scope it to → not our concern.
         if not raw_key or not raw_api_key:
             await self.app(scope, receive, send)
@@ -128,11 +150,16 @@ class IdempotencyMiddleware:
 
         key = raw_key.decode("latin-1")
         api_key_hash = auth.get_api_key_hash(api_key)
-        body, state, tail = await self._read_body(receive)
-        if state != "ok":
-            # oversized body or client disconnect: run uncached, replaying what we
-            # buffered so the app still sees the request.
-            await self.app(scope, tail, send)
+        body, state = await self._read_body(receive)
+        if state == "disconnect":
+            # The client aborted mid-upload. Run nothing (so no charge happens) and
+            # cache nothing — never disguise a truncated request as a completed one.
+            return
+        if state == "overflow":
+            # We can't fingerprint or cache a body we won't fully buffer, and
+            # running it uncached would break exactly-once — so reject it outright
+            # before any side effect, rather than silently downgrading.
+            await self._send(send, 413, _BODY_TOO_LARGE_BODY, _JSON)
             return
 
         fingerprint = _fingerprint(
@@ -157,8 +184,16 @@ class IdempotencyMiddleware:
         # outcome == "new": run the app, capturing its response for storage.
         assert record_id is not None  # noqa: S101 - guaranteed by a "new" outcome
 
+        replayed = {"done": False}
+
         async def replay_receive():
-            return {"type": "http.request", "body": body, "more_body": False}
+            # Replay the buffered body once, then delegate to the real receive so a
+            # streaming response still sees http.disconnect instead of spinning on
+            # an endlessly-repeated terminal message.
+            if not replayed["done"]:
+                replayed["done"] = True
+                return {"type": "http.request", "body": body, "more_body": False}
+            return await receive()
 
         captured = {"status": 500, "headers": [], "body": bytearray(), "too_big": False}
 
@@ -168,25 +203,44 @@ class IdempotencyMiddleware:
                 captured["headers"] = message["headers"]
             elif message["type"] == "http.response.body":
                 if not captured["too_big"]:
-                    captured["body"].extend(message.get("body", b""))
-                    if len(captured["body"]) > self.max_response_bytes:
-                        captured["too_big"] = True  # too large to store
+                    chunk = message.get("body", b"")
+                    # Check the prospective size BEFORE copying, so a single huge
+                    # chunk can't blow past the cap into memory.
+                    if len(captured["body"]) + len(chunk) > self.max_response_bytes:
+                        captured["too_big"] = True
+                        captured["body"] = bytearray()  # release what we held
+                    else:
+                        captured["body"].extend(chunk)
             await send(message)
 
         try:
             await self.app(scope, replay_receive, send_wrapper)
         except Exception:
-            # A non-cancel unhandled error: the charge dependency has already
-            # refunded, so release the key for a genuine retry, then let
-            # ServerErrorMiddleware (outside us) produce the 500. A CancelledError
-            # from a client disconnect is deliberately NOT caught here — the charge
-            # may have committed as the response streamed, so re-running could
-            # double-charge; the record stays and the retry gets 409 until expiry.
+            # The handler RAISED. Under the documented pattern (Depends(charge()))
+            # a raised exception is refunded by the dependency, so the key is safe
+            # to release for a genuine retry; then ServerErrorMiddleware (outside
+            # us) produces the 500. A CancelledError from a client disconnect is
+            # deliberately NOT caught here — the charge may have committed as the
+            # response streamed, so re-running could double-charge; the record
+            # stays and the retry gets 409 until expiry.
             await run_in_threadpool(self._delete, record_id)
             raise
 
-        if captured["status"] >= 500 or captured["too_big"]:
-            await run_in_threadpool(self._delete, record_id)
+        # The handler RETURNED (any status, 5xx included). gringotts charges before
+        # the handler runs, so whatever it returns, the side effect is committed and
+        # not rolled back — cache the outcome so a retry can't run it again. Only a
+        # raised exception (above) releases the key.
+        if captured["too_big"]:
+            # Handler ran (and may have charged) but the response is too large to
+            # store: keep the key locked so a retry can't re-charge; a replay gets a
+            # marker in place of the un-cacheable body.
+            await run_in_threadpool(
+                self._store,
+                record_id,
+                captured["status"],
+                _TRUNCATED_BODY,
+                _TRUNCATED_HEADERS,
+            )
         else:
             await run_in_threadpool(
                 self._store,
@@ -199,25 +253,25 @@ class IdempotencyMiddleware:
     async def _read_body(self, receive):
         """Drain the request body, bounded, detecting a mid-upload disconnect.
 
-        Returns ``(body, state, tail)`` where state is ``ok`` / ``overflow`` /
-        ``disconnect``; for the latter two, ``tail`` is a receive callable that
-        replays what was buffered so the request can still be served uncached.
+        Returns ``(body, state)`` where state is ``ok`` / ``overflow`` /
+        ``disconnect``. A keyed request is only ever run when the whole body was
+        read cleanly (``ok``); the other two states are handled without running
+        the app, so a partial or unbounded request can't slip through uncached.
         """
         chunks: list[bytes] = []
         total = 0
         while True:
             message = await receive()
             if message["type"] == "http.disconnect":
-                return b"".join(chunks), "disconnect", _tail(chunks, False, None)
+                return b"".join(chunks), "disconnect"
             chunk = message.get("body", b"")
             if chunk:
                 chunks.append(chunk)
                 total += len(chunk)
             if total > self.max_body_bytes:
-                more = message.get("more_body", False)
-                return b"".join(chunks), "overflow", _tail(chunks, more, receive)
+                return b"".join(chunks), "overflow"
             if not message.get("more_body", False):
-                return b"".join(chunks), "ok", None
+                return b"".join(chunks), "ok"
 
     async def _send(self, send, status: int, body: bytes, headers) -> None:
         """Send a complete response without invoking the wrapped app."""
@@ -341,22 +395,6 @@ class IdempotencyMiddleware:
         if created.tzinfo is None:
             created = created.replace(tzinfo=UTC)
         return (datetime.now(UTC) - created).total_seconds() > self.retention_seconds
-
-
-def _tail(chunks: list[bytes], more: bool, receive):
-    """A receive callable that replays buffered chunks, then delegates or ends."""
-    buffered = b"".join(chunks)
-    sent = {"done": False}
-
-    async def _recv():
-        if not sent["done"]:
-            sent["done"] = True
-            return {"type": "http.request", "body": buffered, "more_body": more}
-        if receive is not None:
-            return await receive()
-        return {"type": "http.request", "body": b"", "more_body": False}
-
-    return _recv
 
 
 def _dump_headers(headers) -> str:
