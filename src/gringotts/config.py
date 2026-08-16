@@ -43,10 +43,15 @@ def format_money(minor_units: int, currency: str) -> str:
 
 @dataclass(frozen=True)
 class CreditPack:
-    """A purchasable bundle: `credits` for `price_cents` in `currency`.
+    """A purchasable bundle of credits sold through Stripe Checkout.
 
-    `price_cents` is the amount in the currency's smallest unit — cents for USD,
-    whole yen for JPY and other zero-decimal currencies.
+    Attributes:
+        credits: How many credits the buyer receives. Must be positive.
+        price_cents: The price in the currency's smallest unit — cents for USD,
+            whole yen for JPY and other zero-decimal currencies.
+        name: Human-readable pack name shown on the buy page and in Checkout.
+        currency: ISO currency code (default ``"usd"``). All packs in one
+            ``GringottsConfig`` must share a currency.
     """
 
     credits: int
@@ -66,8 +71,21 @@ class CreditPack:
 class GringottsConfig:
     """Settings for the mounted routes and Stripe integration.
 
-    Stripe keys fall back to the `STRIPE_SECRET_KEY` and
-    `STRIPE_WEBHOOK_SECRET` environment variables when not set explicitly.
+    Stripe keys fall back to the ``STRIPE_SECRET_KEY`` and
+    ``STRIPE_WEBHOOK_SECRET`` environment variables when not set explicitly.
+
+    Attributes:
+        packs: Credit packs offered for sale. Empty disables purchasing; all
+            packs must share one currency.
+        stripe_secret_key: Stripe secret key (or ``STRIPE_SECRET_KEY`` env).
+            Required, with packs, to enable Checkout.
+        stripe_webhook_secret: Stripe webhook signing secret (or
+            ``STRIPE_WEBHOOK_SECRET`` env). Required to accept webhooks.
+        success_url: Where Checkout returns on success; defaults to the buy page
+            with ``?status=success``.
+        cancel_url: Where Checkout returns on cancel; defaults to the buy page
+            with ``?status=cancelled``.
+        mount_path: URL prefix the routes mount under (default ``/gringotts``).
     """
 
     packs: list[CreditPack] = field(default_factory=list)

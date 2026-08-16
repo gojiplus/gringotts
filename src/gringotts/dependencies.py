@@ -51,6 +51,13 @@ def charge(cost: CostSpec) -> Callable[..., Iterator[User]]:
 
     Returns:
         A FastAPI dependency usable as ``Depends(charge(5))``.
+
+    Example:
+        >>> from fastapi import Depends
+        >>> from gringotts import CreditedUser, charge
+        >>> @app.post("/predict")  # doctest: +SKIP
+        ... def predict(user: CreditedUser = Depends(charge(1))):
+        ...     return {"credits_left": user.credits}
     """
 
     def dependency(request: Request) -> Iterator[User]:
