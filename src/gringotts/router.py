@@ -65,7 +65,10 @@ def _apply_reversal(
             payment_intent,
         )
         return
-    user = crud.get_user(db, purchase.user_id)
+    # Lock the user row before reading cumulative totals, so two concurrent
+    # partial-refund events for the same purchase can't both read stale totals
+    # and each under-claw — the read, delta calc, and write are serialized.
+    user = crud.lock_user(db, purchase.user_id)
     if user is None:
         logger.error("gringotts webhook %s: reversal user missing", event["id"])
         raise HTTPException(status_code=503, detail="User not found; retry later")
@@ -154,16 +157,25 @@ def _process_dispute(db, event, *, reinstate: bool) -> None:
             dispute_id,
         )
         raise HTTPException(status_code=503, detail="Withdrawal not seen; retry later")
+    purchase = crud.find_purchase_by_payment_intent(db, payment_intent)
+    user = crud.get_user(db, purchase.user_id) if purchase else None
+    if user is None:
+        logger.error("gringotts webhook %s: reinstate user missing", event["id"])
+        return
+    # Always record the reinstatement — even when the withdrawal was clamped to
+    # zero credits — so its negative amount_cents cancels the dispute's
+    # contribution to the cumulative totals. Omitting it would leave the dispute
+    # "active" and over-claw a later refund once the user has credits again.
     restored = crud.clawback_deducted(db, withdrawn_key)
-    if restored:
-        purchase = crud.find_purchase_by_payment_intent(db, payment_intent)
-        user = crud.get_user(db, purchase.user_id) if purchase else None
-        if user is None:
-            logger.error("gringotts webhook %s: reinstate user missing", event["id"])
-            return
-        crud.grant_credits(
-            db, user, restored, kind="reinstate", external_id=f"{dispute_id}:reinstated"
-        )
+    crud.grant_credits(
+        db,
+        user,
+        restored,
+        kind="reinstate",
+        external_id=f"{dispute_id}:reinstated",
+        amount_cents=-dispute_amount,
+        payment_intent_id=payment_intent,
+    )
 
 
 _BUY_PAGE = """<!doctype html>

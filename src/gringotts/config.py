@@ -78,13 +78,20 @@ class GringottsConfig:
     mount_path: str = "/gringotts"
 
     def __post_init__(self) -> None:
-        """Fill Stripe credentials from the environment when not provided."""
+        """Fill Stripe credentials from env and require one currency across packs."""
         self.stripe_secret_key = self.stripe_secret_key or os.getenv(
             "STRIPE_SECRET_KEY"
         )
         self.stripe_webhook_secret = self.stripe_webhook_secret or os.getenv(
             "STRIPE_WEBHOOK_SECRET"
         )
+        # Revenue is a single smallest-unit total, so mixed currencies would make
+        # it meaningless; require all packs to share one currency.
+        currencies = {pack.currency.lower() for pack in self.packs}
+        if len(currencies) > 1:
+            raise ValueError(
+                f"all credit packs must use one currency, got {sorted(currencies)}"
+            )
 
     @property
     def stripe_enabled(self) -> bool:

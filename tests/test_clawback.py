@@ -261,10 +261,64 @@ def test_reinstate_before_withdrawal_asks_retry(db_session):
     assert user.credits == 100
 
 
-def test_purchased_stat_nets_clawbacks(db_session):
+def test_refund_after_reinstated_dispute_claws_correctly(db_session):
+    # withdraw (claw 100) -> reinstate (restore 100) must clear the cumulative,
+    # so a later 250-cent refund claws its proportional 50, not zero.
     client = _client()
-    user = _buy(db_session, client, "pc")  # purchased 100
-    assert crud.aggregate_stats(db_session)["credits_purchased"] == 100
+    user = _buy(db_session, client, "pd")  # 100 credits / 500 cents
+    _post(client, _dispute_event("pi_1", "charge.dispute.funds_withdrawn"))
+    _post(client, _dispute_event("pi_1", "charge.dispute.funds_reinstated"))
+    db_session.refresh(user)
+    assert user.credits == 100  # restored
+    assert _post(client, _refund_event("pi_1", 250)).status_code == 200
+    db_session.refresh(user)
+    assert user.credits == 50  # proportional claw, not under-clawed to 100
+    assert crud.find_balance_discrepancies(db_session) == []
+
+
+def test_null_payment_intent_does_not_claw_unrelated_user(db_session):
+    # a pre-0.3 purchase row (payment_intent_id NULL) must never be matched by a
+    # reversal whose payment_intent is also null.
+    user, _ = auth.create_user_with_key(db_session, "pe", credits=100)
+    db_session.add(
+        models.CreditTransaction(
+            user_id=user.id,
+            amount=100,
+            kind="purchase",
+            balance_after=100,
+            amount_cents=500,
+            payment_intent_id=None,  # legacy row
+        )
+    )
+    db_session.commit()
+    refund = json.loads(_refund_event("pi_x", 500).decode())
+    refund["data"]["object"]["payment_intent"] = None
+    assert _post(_client(), json.dumps(refund).encode()).status_code == 503
+    db_session.refresh(user)
+    assert user.credits == 100  # untouched
+
+
+def test_zero_restore_reinstatement_prevents_later_over_claw(db_session):
+    client = _client()
+    user = _buy(db_session, client, "pf")  # 100 / 500
+    crud.charge_user(db_session, user, 100)  # balance 0
+    _post(client, _dispute_event("pi_1", "charge.dispute.funds_withdrawn"))  # claw 0
+    _post(client, _dispute_event("pi_1", "charge.dispute.funds_reinstated"))  # offset
+    crud.grant_credits(db_session, user, 100, external_id="topup")  # balance 100
+    assert _post(client, _refund_event("pi_1", 250)).status_code == 200
+    db_session.refresh(user)
+    assert user.credits == 50  # proportional 50, not over-clawed to 0
+    assert crud.find_balance_discrepancies(db_session) == []
+
+
+def test_stats_net_clawbacks_from_purchased_and_revenue(db_session):
+    client = _client()
+    user = _buy(db_session, client, "pc")  # purchased 100 for 500 cents
+    stats = crud.aggregate_stats(db_session)
+    assert stats["credits_purchased"] == 100
+    assert stats["revenue_cents"] == 500
     _post(client, _refund_event("pi_1", 500))  # full refund
     db_session.refresh(user)
-    assert crud.aggregate_stats(db_session)["credits_purchased"] == 0  # netted
+    stats = crud.aggregate_stats(db_session)
+    assert stats["credits_purchased"] == 0  # credits netted
+    assert stats["revenue_cents"] == 0  # revenue netted
