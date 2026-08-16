@@ -97,7 +97,7 @@ def charge(cost: CostSpec) -> Callable[..., Iterator[User]]:
                 # GeneratorExit is deliberately not caught: it fires on normal
                 # close and must not trigger a refund.
                 if debited:
-                    _refund_on_fresh_session(user_id, amount, endpoint)
+                    _refund_on_fresh_session(user_id, amount, endpoint, key)
                 raise
         finally:
             session.close()
@@ -105,18 +105,24 @@ def charge(cost: CostSpec) -> Callable[..., Iterator[User]]:
     return dependency
 
 
-def _refund_on_fresh_session(user_id: int, amount: int, endpoint: str) -> None:
+def _refund_on_fresh_session(
+    user_id: int, amount: int, endpoint: str, idempotency_key: str | None = None
+) -> None:
     """Compensate a charge on a brand-new session.
 
     Using a fresh session means a failing handler's uncommitted mutations to
     the yielded user (on the charge session) are discarded when that session
-    closes, never committed by the refund.
+    closes, never committed by the refund. When the charge carried an
+    idempotency key, the key is released so a retry charges fresh rather than
+    replaying a debit that was refunded.
     """
     session = db.SessionLocal()
     try:
         user = crud.get_user(session, user_id)
         if user is not None:
             crud.refund_user(session, user, amount, endpoint=endpoint)
+            if idempotency_key is not None:
+                crud.release_idempotency_key(session, user_id, idempotency_key)
     except Exception:
         # Best-effort: never let a failed refund mask the original exception.
         logger.exception("gringotts: refund failed for user %s", user_id)

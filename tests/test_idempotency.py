@@ -146,6 +146,35 @@ def test_admin_grant_reports_not_applied_on_replay(db_session):
     assert r2.json()["applied"] is False  # not silently reported as a new grant
 
 
+def test_retry_after_refunded_failure_charges_once(db_session):
+    # first keyed attempt fails and is refunded (key released); the retry that
+    # succeeds must be charged — not replayed into free successful work.
+    from fastapi import Depends, FastAPI
+
+    import gringotts
+    from gringotts import CreditedUser, GringottsConfig, charge
+
+    app = FastAPI()
+    gringotts.init_app(app, GringottsConfig())
+    calls = {"n": 0}
+
+    @app.get("/flaky")
+    def flaky(user: CreditedUser = Depends(charge(2))):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("transient failure")
+        return {"ok": True}
+
+    user, key = auth.create_user_with_key(db_session, "fk", credits=10)
+    client = TestClient(app, raise_server_exceptions=False)
+    h = {"X-API-Key": key, "Idempotency-Key": "flk"}
+    assert client.get("/flaky", headers=h).status_code == 500  # fails, refunded
+    assert client.get("/flaky", headers=h).status_code == 200  # succeeds, charged
+    db_session.refresh(user)
+    assert user.credits == 8  # paid once for the successful call, not free
+    assert crud.find_balance_discrepancies(db_session) == []
+
+
 def test_reconcile_clean_after_idempotent_ops(db_session):
     _, key = auth.create_user_with_key(db_session, "e", credits=10)
     client = TestClient(make_app())

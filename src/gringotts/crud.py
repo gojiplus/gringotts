@@ -45,6 +45,21 @@ def keyed_row(
     )
 
 
+def release_idempotency_key(db: Session, user_id: int, idempotency_key: str) -> None:
+    """Clear a user's idempotency key from its ledger row so it can be reused.
+
+    Called when a keyed charge is refunded (its handler failed): the debit was
+    compensated, so a retry with the same key must charge fresh rather than
+    replay — otherwise a later successful retry would deliver paid work for free.
+    Only the operational key is cleared; the ledger amounts stay immutable.
+    """
+    db.query(models.CreditTransaction).filter(
+        models.CreditTransaction.user_id == user_id,
+        models.CreditTransaction.idempotency_key == idempotency_key,
+    ).update({models.CreditTransaction.idempotency_key: None})
+    db.commit()
+
+
 def create_user(
     db: Session,
     username: str,
@@ -111,12 +126,24 @@ def charge_user(
         raise ValueError("charge cost cannot be negative")
     if cost == 0:
         return ChargeResult.CHARGED
-    if idempotency_key is not None:
+
+    def _classify_prior() -> ChargeResult | None:
+        # REPLAYED if a matching prior charge exists, CONFLICT if it exists with
+        # a different cost/endpoint, None if no prior row for this key. Applied at
+        # the precheck AND in both race handlers, so a concurrent same-key retry
+        # for a different operation can't slip past as a plain replay.
+        if idempotency_key is None:
+            return None
         prior = keyed_row(db, user.id, idempotency_key)
-        if prior is not None:
-            if prior.amount != -cost or prior.endpoint != endpoint:
-                return ChargeResult.CONFLICT
-            return ChargeResult.REPLAYED
+        if prior is None:
+            return None
+        if prior.amount != -cost or prior.endpoint != endpoint:
+            return ChargeResult.CONFLICT
+        return ChargeResult.REPLAYED
+
+    precheck = _classify_prior()
+    if precheck is not None:
+        return precheck
     updated = (
         db.query(models.User)
         .filter(models.User.id == user.id, models.User.credits >= cost)
@@ -126,10 +153,9 @@ def charge_user(
         db.rollback()
         db.refresh(user)
         # A concurrent same-key winner may have charged after our precheck; if so
-        # this is a replay, not a genuine 402.
-        if idempotency_key is not None and keyed_row(db, user.id, idempotency_key):
-            return ChargeResult.REPLAYED
-        return ChargeResult.INSUFFICIENT
+        # this is a replay (or a conflict), not a genuine 402.
+        raced = _classify_prior()
+        return raced if raced is not None else ChargeResult.INSUFFICIENT
     db.refresh(user)  # balance after the debit, our own in-transaction write
     db.add(
         models.CreditTransaction(
@@ -147,8 +173,9 @@ def charge_user(
         # a concurrent retry with the same key won the race and charged already
         db.rollback()
         db.refresh(user)
-        if idempotency_key is not None and keyed_row(db, user.id, idempotency_key):
-            return ChargeResult.REPLAYED
+        raced = _classify_prior()
+        if raced is not None:
+            return raced
         raise
     db.refresh(user)
     return ChargeResult.CHARGED
