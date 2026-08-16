@@ -11,11 +11,11 @@ from datetime import UTC, datetime, timedelta
 
 from fastapi import Depends, FastAPI, Response
 from fastapi.testclient import TestClient
+from test_charge import make_app
 
 import gringotts
 from gringotts import CreditedUser, GringottsConfig, auth, charge, crud, models
 from gringotts.idempotency import IdempotencyMiddleware, _fingerprint
-from test_charge import make_app
 
 
 def test_replay_returns_cached_response_and_charges_once(db_session):
