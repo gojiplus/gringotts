@@ -8,5 +8,9 @@
 :maxdepth: 2
 :hidden:
 
+quickstart
+how-it-works
+stripe
+examples
 api
 ```

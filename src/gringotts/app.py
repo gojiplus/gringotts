@@ -13,7 +13,24 @@ def init_app(app: FastAPI, config: GringottsConfig | None = None) -> None:
     """Register the 402 handler and mount the gringotts routes.
 
     Routes (balance, usage, account, purchase page, checkout, webhook, admin)
-    land under `config.mount_path`.
+    land under ``config.mount_path``.
+
+    Args:
+        app: The FastAPI application to wire gringotts into.
+        config: Settings; a default ``GringottsConfig`` (no packs, Stripe off)
+            is used when omitted.
+
+    Example:
+        >>> from fastapi import FastAPI
+        >>> import gringotts
+        >>> from gringotts import GringottsConfig, CreditPack
+        >>> app = FastAPI()
+        >>> gringotts.init_app(
+        ...     app,
+        ...     GringottsConfig(
+        ...         packs=[CreditPack(credits=100, price_cents=500, name="Starter")]
+        ...     ),
+        ... )
     """
     cfg = config or GringottsConfig()
     app.state.gringotts = cfg
