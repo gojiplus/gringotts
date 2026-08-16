@@ -19,10 +19,10 @@ def test_concurrent_partial_refunds_do_not_over_claw(tmp_path):
     # both backends (FOR UPDATE is a no-op on SQLite).
     url = os.getenv("GRINGOTTS_TEST_DATABASE_URL") or f"sqlite:///{tmp_path}/claw.db"
     engine = make_engine(url)
-    SL = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    session_local = sessionmaker(autocommit=False, autoflush=False, bind=engine)
     Base.metadata.drop_all(bind=engine)
     Base.metadata.create_all(bind=engine)
-    with SL() as s:
+    with session_local() as s:
         user, _ = auth.create_user_with_key(s, "race", credits=0)
         uid = user.id
         s.add(
@@ -44,7 +44,7 @@ def test_concurrent_partial_refunds_do_not_over_claw(tmp_path):
 
     def reverse(i):
         # mirrors router._apply_reversal's locked cumulative math
-        s = SL()
+        s = session_local()
         try:
             u = crud.lock_user(s, uid)
             prior_cents, prior_clawed = crud.clawback_totals(s, "pi_race")
@@ -64,7 +64,7 @@ def test_concurrent_partial_refunds_do_not_over_claw(tmp_path):
     with ThreadPoolExecutor(max_workers=4) as pool:
         list(pool.map(reverse, range(4)))
 
-    with SL() as c:
+    with session_local() as c:
         assert crud.get_user(c, uid).credits == 4  # 7 - 3 clawed, not over-clawed
         assert crud.find_balance_discrepancies(c) == []
     engine.dispose()
