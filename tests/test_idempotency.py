@@ -293,7 +293,7 @@ def test_response_over_cap_keeps_lock_and_charges_once(db_session):
     r1 = client.get("/big", headers=h)
     assert r1.json()["data"] == "x" * 100  # first request gets the full response
     r2 = client.get("/big", headers=h)  # replay: lock kept, handler NOT re-run
-    assert r2.headers.get("idempotent-response-truncated") == "true"
+    assert r2.headers.get("idempotent-response-not-cached") == "true"
     db_session.refresh(user)
     assert user.credits == 8  # charged once; the oversized response didn't free the key
 
@@ -472,6 +472,96 @@ def test_streaming_response_is_cached_without_hang(db_session):
     assert r2.headers.get("idempotent-replayed") == "true"
     db_session.refresh(user)
     assert user.credits == 8  # charged once
+
+
+def test_no_store_response_body_is_not_persisted(db_session):
+    # the admin create-user response carries the one-time API key; caching it must
+    # not persist that secret in idempotency_records
+    from test_router import make_app as make_stripe_app
+
+    _, admin_key = auth.create_user_with_key(
+        db_session, "root", credits=0, is_admin=True
+    )
+    client = TestClient(make_stripe_app())
+    h = {"X-API-Key": admin_key, "Idempotency-Key": "mk1"}
+    r = client.post("/gringotts/admin/users", data={"username": "newbie"}, headers=h)
+    assert r.status_code == 201
+    new_key = r.json()["api_key"]
+    # the response was cached (key locked) but WITHOUT the secret body
+    rec = (
+        db_session.query(models.IdempotencyRecord)
+        .filter_by(idempotency_key="mk1")
+        .one()
+    )
+    assert rec.completed is True
+    assert rec.response_body is not None
+    assert new_key.encode() not in rec.response_body  # the API key is not stored
+    # a replay returns the marker, not the secret
+    r2 = client.post("/gringotts/admin/users", data={"username": "newbie"}, headers=h)
+    assert new_key not in r2.text
+    assert r2.headers.get("idempotent-response-not-cached") == "true"
+
+
+def test_interrupted_stream_is_not_replayed_as_complete(db_session):
+    # a streaming handler that raises mid-stream must not have its partial body
+    # replayed as if complete
+    from fastapi.responses import StreamingResponse
+
+    app = FastAPI()
+    gringotts.init_app(app, GringottsConfig())
+
+    @app.get("/partial")
+    def partial(user: CreditedUser = Depends(charge(2))):
+        def gen():
+            yield b"first"
+            raise RuntimeError("stream broke")
+
+        return StreamingResponse(gen(), media_type="text/plain")
+
+    _, key = auth.create_user_with_key(db_session, "ps", credits=10)
+    client = TestClient(app, raise_server_exceptions=False)
+    h = {"X-API-Key": key, "Idempotency-Key": "pk"}
+    client.get("/partial", headers=h)  # started, then raised mid-stream
+    rec = (
+        db_session.query(models.IdempotencyRecord).filter_by(idempotency_key="pk").one()
+    )
+    # stored as a marker (not the partial "first" bytes), key kept locked
+    assert b"first" not in (rec.response_body or b"")
+    assert rec.completed is True
+
+
+def test_prune_retains_in_flight_by_default(db_session):
+    from datetime import UTC, datetime, timedelta
+
+    old = datetime.now(UTC) - timedelta(days=2)
+    db_session.add(
+        models.IdempotencyRecord(
+            api_key_hash="h",
+            idempotency_key="done",
+            request_fingerprint="f",
+            completed=True,
+            created_at=old,
+        )
+    )
+    db_session.add(
+        models.IdempotencyRecord(
+            api_key_hash="h",
+            idempotency_key="inflight",
+            request_fingerprint="f",
+            completed=False,  # a live lock, even though old
+            created_at=old,
+        )
+    )
+    db_session.commit()
+    deleted = crud.purge_idempotency_records(db_session, older_than_seconds=86_400)
+    assert deleted == 1  # only the completed one; the in-flight lock is retained
+    remaining = {r.idempotency_key for r in db_session.query(models.IdempotencyRecord)}
+    assert remaining == {"inflight"}
+    # explicit opt-in clears the in-flight lock too
+    crud.purge_idempotency_records(
+        db_session, older_than_seconds=86_400, include_in_flight=True
+    )
+    assert db_session.query(models.IdempotencyRecord).count() == 0
 
 
 def test_prune_idempotency_records(db_session):

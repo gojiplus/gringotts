@@ -122,6 +122,9 @@ def build_admin_router(config: GringottsConfig) -> APIRouter:
         user, api_key = auth.create_user_with_key(
             db, username, credits, is_admin=is_admin
         )
+        # The response carries the one-time API key; no-store keeps the idempotency
+        # middleware from persisting that secret in its response cache.
+        no_store = {"Cache-Control": "no-store"}
         if not _is_htmx(request):
             return JSONResponse(
                 {
@@ -132,13 +135,16 @@ def build_admin_router(config: GringottsConfig) -> APIRouter:
                     "api_key": api_key,
                 },
                 status_code=201,
+                headers=no_store,
             )
         fragment = (
             f"<p>Created <strong>{html.escape(user.username)}</strong>."
             " API key (shown once):</p>"
             f'<div class="keyreveal">{html.escape(api_key)}</div>'
         )
-        return HTMLResponse(fragment, headers={"HX-Trigger": "users-changed"})
+        return HTMLResponse(
+            fragment, headers={"HX-Trigger": "users-changed", **no_store}
+        )
 
     @router.post("/admin/users/{user_id}/grant")
     def grant(

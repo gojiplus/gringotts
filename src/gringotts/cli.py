@@ -57,6 +57,11 @@ def main(argv: list[str] | None = None) -> None:
         default=86_400.0,
         help="Delete records older than this (default 86400 = 24h)",
     )
+    p_prune.add_argument(
+        "--include-in-flight",
+        action="store_true",
+        help="Also delete in-flight locks (only when sure none are still running)",
+    )
 
     args = parser.parse_args(argv)
 
@@ -123,7 +128,11 @@ def main(argv: list[str] | None = None) -> None:
                     )
                 raise SystemExit(f"{len(discrepancies)} balance(s) do not reconcile")
         elif args.cmd == "prune-idempotency":
-            deleted = crud.purge_idempotency_records(session, args.older_than_seconds)
+            deleted = crud.purge_idempotency_records(
+                session,
+                args.older_than_seconds,
+                include_in_flight=args.include_in_flight,
+            )
             print(f"Deleted {deleted} idempotency record(s)")
         elif args.cmd == "balance":
             user = crud.get_user_by_username(session, args.username)

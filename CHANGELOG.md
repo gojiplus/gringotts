@@ -24,8 +24,11 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     released and a genuine retry re-attempts. A `4xx` (including a `402` for
     insufficient credits) *is* cached; use a fresh key for a fresh attempt.
   - Only **authenticated callers** create records (an invalid key can't fill the
-    table); records are **bounded** (oversized request bodies and responses stream
-    through uncached) and **expire** after `idempotency_retention_seconds`.
+    table); an oversized request body is rejected with `413` and a response too
+    large to cache keeps the key locked with a marker; records **expire** after
+    `idempotency_retention_seconds`.
+  - A response marked `Cache-Control: no-store` is not persisted — so the admin
+    create-user route's one-time API key is never written to the response cache.
   - An **in-flight or crashed** request is never auto-re-run — a duplicate or a
     retry of an unknown outcome gets `409`, because age can't prove the first
     attempt didn't already charge. A reused key expires lazily; to bound table

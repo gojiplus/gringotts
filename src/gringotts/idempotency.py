@@ -67,8 +67,8 @@ _BODY_TOO_LARGE_BODY = json.dumps(
 # Stored for a request whose response was too large to cache: the charge already
 # happened once, so a replay must return this (keeping the key locked) rather than
 # re-running the handler.
-_TRUNCATED_BODY = json.dumps(
-    {"detail": "The request was processed; its response was too large to cache."}
+_MARKER_BODY = json.dumps(
+    {"detail": "The request was processed; its response was not cached for replay."}
 ).encode()
 
 
@@ -198,6 +198,7 @@ class IdempotencyMiddleware:
             "body": bytearray(),
             "too_big": False,
             "started": False,
+            "finished": False,
         }
 
         async def send_wrapper(message):
@@ -215,6 +216,10 @@ class IdempotencyMiddleware:
                         captured["body"] = bytearray()  # release what we held
                     else:
                         captured["body"].extend(chunk)
+                # The terminal frame (more_body False/absent) marks a complete
+                # response; an interrupted stream never sends it.
+                if not message.get("more_body", False):
+                    captured["finished"] = True
             await send(message)
 
         try:
@@ -311,14 +316,40 @@ class IdempotencyMiddleware:
         try:
             record = self._get(session, api_key_hash, key)
             if record is not None and record.completed and self._expired(record):
-                # A key past its retention is reusable; drop it and start fresh. Use
-                # a filtered bulk delete (not session.delete) so two concurrent
-                # requests both expiring the same row don't raise StaleDataError.
-                session.query(IdempotencyRecord).filter(
-                    IdempotencyRecord.id == record.id
-                ).delete(synchronize_session=False)
+                # A key past its retention is reusable. Reclaim the row IN PLACE
+                # with a guarded UPDATE rather than delete+insert: on SQLite the
+                # deleted INTEGER PRIMARY KEY can be reused, so a delete+insert race
+                # could let a second request delete the first's fresh claim. The
+                # created_at guard means exactly one concurrent racer wins the
+                # reclaim; the loser (rowcount 0) falls through and sees the winner's
+                # in-progress row -> 409.
+                now = datetime.now(UTC)
+                reclaimed = (
+                    session.query(IdempotencyRecord)
+                    .filter(
+                        IdempotencyRecord.id == record.id,
+                        IdempotencyRecord.created_at == record.created_at,
+                        IdempotencyRecord.completed.is_(True),
+                    )
+                    .update(
+                        {
+                            IdempotencyRecord.completed: False,
+                            IdempotencyRecord.request_fingerprint: fingerprint,
+                            IdempotencyRecord.created_at: now,
+                            IdempotencyRecord.status_code: None,
+                            IdempotencyRecord.response_body: None,
+                            IdempotencyRecord.response_headers: None,
+                        },
+                        synchronize_session=False,
+                    )
+                )
                 session.commit()
-                record = None
+                if reclaimed:
+                    return ("new", record.id, None)
+                # Lost the reclaim race: re-read and classify the winner's row.
+                record = self._get(session, api_key_hash, key)
+                if record is None:  # pragma: no cover - vanished mid-race
+                    return ("in_progress", None, None)
             if record is None:
                 fresh = IdempotencyRecord(
                     api_key_hash=api_key_hash,
@@ -353,28 +384,38 @@ class IdempotencyMiddleware:
     def _persist(self, record_id: int, captured: dict) -> None:
         """Store a handler's captured response under a record. Worker thread.
 
-        A response too large to cache is stored as a small marker body while
-        keeping the original headers (so a redirect's ``Location`` or a
-        ``Set-Cookie`` still replays) plus an ``idempotent-response-truncated``
-        flag — the point is to keep the key locked so a retry can't re-run a
-        committed side effect, not to reproduce the oversized body.
+        The body is replaced with a small JSON marker (keeping the key locked so a
+        retry can't re-run a committed side effect) when it can't or shouldn't be
+        served verbatim: too large to cache, an interrupted stream (partial body),
+        or a ``Cache-Control: no-store`` response (e.g. one that issued a
+        credential — never persist that body). Side-effect headers such as
+        ``Location`` / ``Set-Cookie`` are kept, but representation headers
+        (content-type/length/encoding) are dropped since the body is now JSON.
         """
-        if captured["too_big"]:
-            # keep side-effect headers (Location, Set-Cookie), but the body is now a
-            # JSON marker, so drop the original content-type and set it to match.
+        no_store = _has_no_store(captured["headers"])
+        if captured["too_big"] or not captured["finished"] or no_store:
             kept = [
                 (name, value)
                 for name, value in captured["headers"]
-                if name.lower() not in (b"content-length", b"content-type")
+                if name.lower()
+                not in (b"content-length", b"content-type", b"content-encoding")
             ]
-            headers = _dump_headers(
-                kept,
-                extra=[
-                    ("content-type", "application/json"),
-                    ("idempotent-response-truncated", "true"),
-                ],
+            if no_store:
+                # Never persist a no-store body (it may hold a secret) or its
+                # side-effect headers (e.g. Set-Cookie); keep only the status.
+                kept = []
+            self._store(
+                record_id,
+                captured["status"],
+                _MARKER_BODY,
+                _dump_headers(
+                    kept,
+                    extra=[
+                        ("content-type", "application/json"),
+                        ("idempotent-response-not-cached", "true"),
+                    ],
+                ),
             )
-            self._store(record_id, captured["status"], _TRUNCATED_BODY, headers)
         else:
             self._store(
                 record_id,
@@ -446,6 +487,14 @@ def _dump_headers(headers, extra=None) -> str:
     if extra:
         pairs.extend([list(pair) for pair in extra])
     return json.dumps(pairs)
+
+
+def _has_no_store(headers) -> bool:
+    """Whether the response asked not to be stored (``Cache-Control: no-store``)."""
+    for name, value in headers:
+        if name.lower() == b"cache-control" and b"no-store" in value.lower():
+            return True
+    return False
 
 
 def _load_headers(headers_json: str | None):

@@ -476,21 +476,28 @@ def find_balance_discrepancies(db: Session) -> list[dict]:
     return discrepancies
 
 
-def purge_idempotency_records(db: Session, older_than_seconds: float) -> int:
+def purge_idempotency_records(
+    db: Session, older_than_seconds: float, include_in_flight: bool = False
+) -> int:
     """Delete idempotency records older than `older_than_seconds`; return the count.
 
-    Response caching stores a row per keyed request; this reclaims space and clears
-    stuck in-flight records. The middleware also expires records lazily on reuse,
-    so this is for records that are simply never retried.
+    Response caching stores a row per keyed request; this reclaims space from keys
+    that are never retried (the middleware also expires records lazily on reuse).
+    Only **completed** records are removed by default: an in-flight (`completed=
+    False`) row is a live lock, and deleting it could free a key whose request is
+    still running, letting a retry execute the side effect again. Pass
+    `include_in_flight=True` only to clear locks left by crashed requests, when you
+    know none are genuinely still running.
     """
     from datetime import UTC, datetime, timedelta
 
     cutoff = datetime.now(UTC) - timedelta(seconds=older_than_seconds)
-    deleted = (
-        db.query(models.IdempotencyRecord)
-        .filter(models.IdempotencyRecord.created_at < cutoff)
-        .delete(synchronize_session=False)
+    query = db.query(models.IdempotencyRecord).filter(
+        models.IdempotencyRecord.created_at < cutoff
     )
+    if not include_in_flight:
+        query = query.filter(models.IdempotencyRecord.completed.is_(True))
+    deleted = query.delete(synchronize_session=False)
     db.commit()
     return int(deleted)
 
