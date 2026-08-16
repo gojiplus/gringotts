@@ -74,10 +74,19 @@ def charge(cost: CostSpec) -> Callable[..., Iterator[User]]:
             endpoint = request.url.path
             # An optional Idempotency-Key makes a retried request charge once.
             key = request.headers.get(IDEMPOTENCY_HEADER)
-            if not crud.charge_user(
+            result = crud.charge_user(
                 session, user, amount, endpoint=endpoint, idempotency_key=key
-            ):
+            )
+            if result is crud.ChargeResult.INSUFFICIENT:
                 raise PaymentRequiredError(cost=amount, balance=user.credits)
+            if result is crud.ChargeResult.CONFLICT:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Idempotency-Key reused with a different request",
+                )
+            # Only refund a debit this invocation actually made — a replayed key
+            # made no debit, so refunding it would mint credits.
+            debited = result is crud.ChargeResult.CHARGED
             user_id = user.id
             try:
                 yield user
@@ -87,7 +96,8 @@ def charge(cost: CostSpec) -> Callable[..., Iterator[User]]:
                 # alone would let it consume credits for undelivered work).
                 # GeneratorExit is deliberately not caught: it fires on normal
                 # close and must not trigger a refund.
-                _refund_on_fresh_session(user_id, amount, endpoint)
+                if debited:
+                    _refund_on_fresh_session(user_id, amount, endpoint)
                 raise
         finally:
             session.close()

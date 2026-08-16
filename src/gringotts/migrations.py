@@ -118,12 +118,13 @@ def _add_idempotency_key(conn) -> None:
         conn.execute(
             text("ALTER TABLE credit_transactions ADD COLUMN idempotency_key VARCHAR")
         )
-    # SQLite can't ADD a UNIQUE column, but a unique index after the fact is fine
-    # on both backends; NULLs don't collide, so existing rows are unaffected.
+    # Scoped per user so one caller can't reuse another's key. A unique index
+    # after the fact is fine on both backends; NULLs don't collide, so existing
+    # rows are unaffected.
     conn.execute(
         text(
-            "CREATE UNIQUE INDEX IF NOT EXISTS uq_credit_tx_idempotency_key "
-            "ON credit_transactions (idempotency_key)"
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_credit_tx_user_idempotency_key "
+            "ON credit_transactions (user_id, idempotency_key)"
         )
     )
 

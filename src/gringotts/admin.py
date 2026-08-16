@@ -155,10 +155,14 @@ def build_admin_router(config: GringottsConfig) -> APIRouter:
             raise HTTPException(status_code=404, detail="User not found")
         # An optional Idempotency-Key makes a retried grant apply once.
         key = request.headers.get("Idempotency-Key")
-        crud.grant_credits(db, user, amount, idempotency_key=key)
+        applied = crud.grant_credits(db, user, amount, idempotency_key=key)
         db.refresh(user)
         if not _is_htmx(request):
-            return JSONResponse({"id": user.id, "balance": user.credits})
+            # `applied` is False when this key already granted — tell the caller
+            # rather than silently returning a success-looking response.
+            return JSONResponse(
+                {"id": user.id, "balance": user.credits, "applied": applied}
+            )
         return users(request, admin, db)
 
     @router.get("/admin/users/{user_id}/usage")

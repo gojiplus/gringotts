@@ -159,7 +159,9 @@ def test_concurrent_charges_never_overspend(tmp_path):
         session = session_local()
         try:
             target = crud.get_user(session, user_id)
-            return crud.charge_user(session, target, 1, endpoint="/t")
+            return crud.charge_user(session, target, 1, endpoint="/t") is (
+                crud.ChargeResult.CHARGED
+            )
         finally:
             session.close()
 

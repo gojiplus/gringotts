@@ -12,8 +12,11 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   a `charge()`-guarded endpoint or to the admin grant route (or `--idempotency-key`
   to `gringotts add-credits`), and a retried request applies **at most once** — the
   repeat returns the first result instead of charging or granting again, safe even
-  under concurrent delivery. Backed by a new unique `idempotency_key` column on the
-  ledger (applied by `gringotts migrate`). Requests without a key behave as before.
+  under concurrent delivery. Keys are **scoped per user**, so one caller can't reuse
+  another's key to skip payment; reusing a key for a different cost or endpoint
+  returns `409 Conflict`. Backed by a new per-user-unique `idempotency_key` column
+  on the ledger (applied by `gringotts migrate`). Requests without a key behave as
+  before.
 - Curated documentation site: a grouped API reference, documented config fields,
   usage examples, and new guides (Quickstart, How it works, Stripe & webhooks,
   Examples).

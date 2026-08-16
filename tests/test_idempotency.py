@@ -69,6 +69,83 @@ def test_admin_grant_idempotent_on_header(db_session):
     assert victim.credits == 25  # granted once despite two identical requests
 
 
+def test_idempotency_key_is_scoped_per_user(db_session):
+    # a shared key must not let user B skip payment by replaying user A's key
+    ua, ka = auth.create_user_with_key(db_session, "ua", credits=10)
+    ub, kb = auth.create_user_with_key(db_session, "ub", credits=10)
+    client = TestClient(make_app())
+    client.get("/hello", headers={"X-API-Key": ka, "Idempotency-Key": "shared"})
+    client.get("/hello", headers={"X-API-Key": kb, "Idempotency-Key": "shared"})
+    db_session.refresh(ua)
+    db_session.refresh(ub)
+    assert ua.credits == 8
+    assert ub.credits == 8  # user B was charged, not given free usage
+
+
+def test_replay_of_failing_handler_does_not_mint_credits(db_session):
+    user, key = auth.create_user_with_key(db_session, "rb", credits=10)
+    client = TestClient(make_app(), raise_server_exceptions=False)
+    h = {"X-API-Key": key, "Idempotency-Key": "b1"}
+    client.get("/boom", headers=h)  # charged 2, raises, refunded -> 10
+    client.get("/boom", headers=h)  # replay: no debit, must not refund again
+    db_session.refresh(user)
+    assert user.credits == 10  # not minted to 12
+
+
+def test_replay_takes_precedence_over_insufficient(db_session):
+    user, _ = auth.create_user_with_key(db_session, "cr", credits=2)
+    assert (
+        crud.charge_user(db_session, user, 2, endpoint="/x", idempotency_key="k")
+        is crud.ChargeResult.CHARGED
+    )
+    # balance is 0 now, but the same key is a replay, not a 402
+    assert (
+        crud.charge_user(db_session, user, 2, endpoint="/x", idempotency_key="k")
+        is crud.ChargeResult.REPLAYED
+    )
+
+
+def test_key_reused_with_different_cost_conflicts(db_session):
+    user, key = auth.create_user_with_key(db_session, "cf", credits=10)
+    client = TestClient(make_app())
+    assert (
+        client.get(
+            "/units",
+            headers={"X-API-Key": key, "X-Units": "1", "Idempotency-Key": "u1"},
+        ).status_code
+        == 200
+    )
+    # same key, different cost -> 409 conflict
+    assert (
+        client.get(
+            "/units",
+            headers={"X-API-Key": key, "X-Units": "5", "Idempotency-Key": "u1"},
+        ).status_code
+        == 409
+    )
+    db_session.refresh(user)
+    assert user.credits == 9  # only the first (cost 1) charge applied
+
+
+def test_admin_grant_reports_not_applied_on_replay(db_session):
+    from test_router import make_app as make_stripe_app
+
+    _, admin_key = auth.create_user_with_key(
+        db_session, "root2", credits=0, is_admin=True
+    )
+    victim, _ = auth.create_user_with_key(db_session, "w", credits=0)
+    client = TestClient(make_stripe_app())
+    h = {"X-API-Key": admin_key, "Idempotency-Key": "ag"}
+    r1 = client.post(
+        f"/gringotts/admin/users/{victim.id}/grant", data={"amount": "25"}, headers=h
+    )
+    r2 = client.post(
+        f"/gringotts/admin/users/{victim.id}/grant", data={"amount": "25"}, headers=h
+    )
+    assert r1.json()["applied"] is True
+    assert r2.json()["applied"] is False  # not silently reported as a new grant
+
+
 def test_reconcile_clean_after_idempotent_ops(db_session):
     _, key = auth.create_user_with_key(db_session, "e", credits=10)
     client = TestClient(make_app())

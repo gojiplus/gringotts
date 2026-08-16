@@ -41,8 +41,11 @@ class CreditTransaction(Base):
     # the ledger is self-verifying rather than only reconciled against a cache.
     __table_args__ = (
         CheckConstraint("balance_after >= 0", name="ck_credit_tx_balance_nonneg"),
+        # scoped per user so one caller can't reuse another's Idempotency-Key to
+        # skip payment; NULLs don't collide, so unkeyed rows are unaffected
         Index(
-            "uq_credit_tx_idempotency_key",
+            "uq_credit_tx_user_idempotency_key",
+            "user_id",
             "idempotency_key",
             unique=True,
         ),

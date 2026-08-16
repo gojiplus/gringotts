@@ -82,7 +82,7 @@ def test_migrate_adds_payment_intent_id(tmp_path):
         assert "payment_intent_id" in cols
         assert "balance_after" in cols
         assert "idempotency_key" in cols
-        assert "uq_credit_tx_idempotency_key" in indexes
+        assert "uq_credit_tx_user_idempotency_key" in indexes
     finally:
         engine.dispose()
 

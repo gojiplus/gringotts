@@ -37,9 +37,15 @@ def test_get_user_by_api_key(db_session):
 
 def test_charge_user_atomic_with_ledger(db_session):
     user, _ = auth.create_user_with_key(db_session, "dave", credits=3)
-    assert crud.charge_user(db_session, user, 2, endpoint="/x")
+    assert (
+        crud.charge_user(db_session, user, 2, endpoint="/x")
+        is crud.ChargeResult.CHARGED
+    )
     assert user.credits == 1
-    assert not crud.charge_user(db_session, user, 5, endpoint="/x")
+    assert (
+        crud.charge_user(db_session, user, 5, endpoint="/x")
+        is crud.ChargeResult.INSUFFICIENT
+    )
     db_session.refresh(user)
     assert user.credits == 1
     assert ledger_sum(db_session, user.id) == user.credits

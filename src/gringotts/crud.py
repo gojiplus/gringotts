@@ -1,5 +1,6 @@
 """Database operations: users, atomic credit movements, and ledger queries."""
 
+import enum
 import logging
 
 from sqlalchemy import case, func
@@ -9,6 +10,39 @@ from sqlalchemy.orm import Session
 from . import auth, models
 
 logger = logging.getLogger(__name__)
+
+
+class ChargeResult(enum.Enum):
+    """Outcome of :func:`charge_user`.
+
+    ``CHARGED`` means this call debited the balance (and must be refunded if the
+    request then fails); ``REPLAYED`` means an idempotent retry matched a prior
+    charge and nothing was debited (so it must *not* be refunded); ``INSUFFICIENT``
+    means too few credits; ``CONFLICT`` means the ``idempotency_key`` was reused
+    for a different cost or endpoint.
+    """
+
+    CHARGED = "charged"
+    REPLAYED = "replayed"
+    INSUFFICIENT = "insufficient"
+    CONFLICT = "conflict"
+
+
+def keyed_row(
+    db: Session, user_id: int, idempotency_key: str
+) -> models.CreditTransaction | None:
+    """Return this user's ledger row for an idempotency key, or None.
+
+    Scoped to ``user_id`` so one caller can never see another's keyed row.
+    """
+    return (
+        db.query(models.CreditTransaction)
+        .filter(
+            models.CreditTransaction.user_id == user_id,
+            models.CreditTransaction.idempotency_key == idempotency_key,
+        )
+        .first()
+    )
 
 
 def create_user(
@@ -63,22 +97,26 @@ def charge_user(
     cost: int,
     endpoint: str | None = None,
     idempotency_key: str | None = None,
-) -> bool:
-    """Atomically deduct `cost` if the balance suffices.
+) -> ChargeResult:
+    """Atomically deduct `cost` if the balance suffices, returning a `ChargeResult`.
 
-    The ledger row is written in the same transaction as the balance update.
-    Returns False (and leaves the balance untouched) when credits are short.
-    A `cost` of 0 is a no-op that succeeds without a ledger row; a negative
-    `cost` raises ValueError, since a charge must never raise a balance. When
-    `idempotency_key` is given, a retry with the same key charges only once and
-    returns True without deducting again.
+    The ledger row is written in the same transaction as the balance update. A
+    `cost` of 0 is a no-op reported as ``CHARGED``; a negative `cost` raises
+    ValueError, since a charge must never raise a balance. When `idempotency_key`
+    is given (scoped to this user), a retry with the same key charges only once:
+    a matching retry returns ``REPLAYED`` without deducting, and reusing the key
+    for a different cost or endpoint returns ``CONFLICT``.
     """
     if cost < 0:
         raise ValueError("charge cost cannot be negative")
     if cost == 0:
-        return True
-    if idempotency_key is not None and idempotency_key_exists(db, idempotency_key):
-        return True  # already charged under this key
+        return ChargeResult.CHARGED
+    if idempotency_key is not None:
+        prior = keyed_row(db, user.id, idempotency_key)
+        if prior is not None:
+            if prior.amount != -cost or prior.endpoint != endpoint:
+                return ChargeResult.CONFLICT
+            return ChargeResult.REPLAYED
     updated = (
         db.query(models.User)
         .filter(models.User.id == user.id, models.User.credits >= cost)
@@ -87,7 +125,11 @@ def charge_user(
     if not updated:
         db.rollback()
         db.refresh(user)
-        return False
+        # A concurrent same-key winner may have charged after our precheck; if so
+        # this is a replay, not a genuine 402.
+        if idempotency_key is not None and keyed_row(db, user.id, idempotency_key):
+            return ChargeResult.REPLAYED
+        return ChargeResult.INSUFFICIENT
     db.refresh(user)  # balance after the debit, our own in-transaction write
     db.add(
         models.CreditTransaction(
@@ -105,11 +147,11 @@ def charge_user(
         # a concurrent retry with the same key won the race and charged already
         db.rollback()
         db.refresh(user)
-        if idempotency_key is not None and idempotency_key_exists(db, idempotency_key):
-            return True
+        if idempotency_key is not None and keyed_row(db, user.id, idempotency_key):
+            return ChargeResult.REPLAYED
         raise
     db.refresh(user)
-    return True
+    return ChargeResult.CHARGED
 
 
 def refund_user(
@@ -160,7 +202,7 @@ def grant_credits(
     """
     if amount < 0:
         raise ValueError("grant amount cannot be negative")
-    if idempotency_key is not None and idempotency_key_exists(db, idempotency_key):
+    if idempotency_key is not None and keyed_row(db, user.id, idempotency_key):
         return False  # already granted under this key
     db.query(models.User).filter(models.User.id == user.id).update(
         {models.User.credits: models.User.credits + amount}
@@ -187,7 +229,7 @@ def grant_credits(
         # must not swallow, or a valid grant would vanish silently.
         if external_id is not None and external_id_exists(db, external_id):
             return False
-        if idempotency_key is not None and idempotency_key_exists(db, idempotency_key):
+        if idempotency_key is not None and keyed_row(db, user.id, idempotency_key):
             return False
         raise
     db.refresh(user)
@@ -199,16 +241,6 @@ def external_id_exists(db: Session, external_id: str) -> bool:
     return (
         db.query(models.CreditTransaction.id)
         .filter(models.CreditTransaction.external_id == external_id)
-        .first()
-        is not None
-    )
-
-
-def idempotency_key_exists(db: Session, idempotency_key: str) -> bool:
-    """Whether a ledger row already carries this idempotency key."""
-    return (
-        db.query(models.CreditTransaction.id)
-        .filter(models.CreditTransaction.idempotency_key == idempotency_key)
         .first()
         is not None
     )
