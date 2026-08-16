@@ -37,19 +37,24 @@ with SessionLocal() as db:
 
 ## Idempotent requests
 
-Pass an `Idempotency-Key` header and a retried request is applied at most once —
-the repeat returns the first result instead of charging again:
+Pass an `Idempotency-Key` header and a retried request applies **exactly once**:
+the first request runs and its response is stored; the retry returns that stored
+response verbatim, without re-running the handler — so the charge happens once and
+the retry even gets the original result back (with an `Idempotent-Replayed: true`
+header):
 
 ```bash
-# both calls together charge once
+# both calls together charge once; the second returns the first's response
 curl -X POST localhost:8000/predict \
   -H "X-API-Key: gk_..." -H "Idempotency-Key: order-42"
 curl -X POST localhost:8000/predict \
   -H "X-API-Key: gk_..." -H "Idempotency-Key: order-42"
 ```
 
-The same works for the admin grant route and, from the CLI, `gringotts
-add-credits <user> <n> --idempotency-key <key>`.
+Keys are scoped to the caller, so one caller can't replay another's key. Reusing a
+key for a materially different request (method, path, or body) returns `409`. A
+server error (5xx) isn't cached, so a genuine retry re-attempts. The same caching
+covers the admin grant route and every other mutating endpoint your app serves.
 
 ## Admin API
 

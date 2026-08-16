@@ -39,11 +39,7 @@ def requires_credits(cost: int = 1):
                 user = authenticate(session, request.headers.get(API_KEY_HEADER))
                 from .exceptions import PaymentRequiredError
 
-                # legacy decorator: no idempotency key, so this always debits
-                if (
-                    crud.charge_user(session, user, cost, endpoint=endpoint)
-                    is crud.ChargeResult.INSUFFICIENT
-                ):
+                if not crud.charge_user(session, user, cost, endpoint=endpoint):
                     raise PaymentRequiredError(cost=cost, balance=user.credits)
                 return user.id, endpoint
             finally:

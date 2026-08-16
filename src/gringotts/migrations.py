@@ -113,26 +113,20 @@ def _add_payment_intent_id(conn) -> None:
     )
 
 
-def _add_idempotency_key(conn) -> None:
-    if not _has_column(conn, "credit_transactions", "idempotency_key"):
-        conn.execute(
-            text("ALTER TABLE credit_transactions ADD COLUMN idempotency_key VARCHAR")
-        )
-    # Scoped per user so one caller can't reuse another's key. A unique index
-    # after the fact is fine on both backends; NULLs don't collide, so existing
-    # rows are unaffected.
-    conn.execute(
-        text(
-            "CREATE UNIQUE INDEX IF NOT EXISTS uq_credit_tx_user_idempotency_key "
-            "ON credit_transactions (user_id, idempotency_key)"
-        )
-    )
+def _add_idempotency_records(conn) -> None:
+    # A whole new table (response cache for Idempotency-Key), so create it from
+    # the model's own DDL rather than hand-writing per-backend SQL. checkfirst
+    # makes it a no-op when the table already exists (fresh install / re-run).
+    from .db import Base
+    from .models import IdempotencyRecord  # noqa: F401 - registers the table
+
+    Base.metadata.tables["idempotency_records"].create(bind=conn, checkfirst=True)
 
 
 STEPS: list[tuple[int, str, Callable]] = [
     (1, "add balance_after running-balance to credit_transactions", _add_balance_after),
     (2, "add payment_intent_id to credit_transactions", _add_payment_intent_id),
-    (3, "add idempotency_key to credit_transactions", _add_idempotency_key),
+    (3, "add the idempotency_records response-cache table", _add_idempotency_records),
 ]
 
 HEAD = STEPS[-1][0] if STEPS else 0

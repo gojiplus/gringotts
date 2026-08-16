@@ -36,10 +36,6 @@ def main(argv: list[str] | None = None) -> None:
     p_add = sub.add_parser("add-credits", help="Grant credits to a user")
     p_add.add_argument("username")
     p_add.add_argument("credits", type=int)
-    p_add.add_argument(
-        "--idempotency-key",
-        help="Apply this grant at most once, even if the command is retried",
-    )
 
     p_balance = sub.add_parser("balance", help="Show a user's balance")
     p_balance.add_argument("username")
@@ -102,17 +98,9 @@ def main(argv: list[str] | None = None) -> None:
             user = crud.get_user_by_username(session, args.username)
             if user is None:
                 raise SystemExit(f"User {args.username} not found")
-            applied = crud.grant_credits(
-                session, user, args.credits, idempotency_key=args.idempotency_key
-            )
+            crud.grant_credits(session, user, args.credits)
             session.refresh(user)
-            if not applied and args.idempotency_key:
-                print(
-                    f"Grant with key {args.idempotency_key!r} already applied; "
-                    f"{user.username} has {user.credits} credits"
-                )
-            else:
-                print(f"User {user.username} now has {user.credits} credits")
+            print(f"User {user.username} now has {user.credits} credits")
         elif args.cmd == "reconcile":
             discrepancies = crud.find_balance_discrepancies(session)
             if not discrepancies:

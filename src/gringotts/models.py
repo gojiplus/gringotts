@@ -2,7 +2,14 @@
 
 from datetime import UTC, datetime
 
-from sqlalchemy import CheckConstraint, DateTime, ForeignKey, Index, String
+from sqlalchemy import (
+    CheckConstraint,
+    DateTime,
+    ForeignKey,
+    Index,
+    LargeBinary,
+    String,
+)
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .db import Base
@@ -41,14 +48,6 @@ class CreditTransaction(Base):
     # the ledger is self-verifying rather than only reconciled against a cache.
     __table_args__ = (
         CheckConstraint("balance_after >= 0", name="ck_credit_tx_balance_nonneg"),
-        # scoped per user so one caller can't reuse another's Idempotency-Key to
-        # skip payment; NULLs don't collide, so unkeyed rows are unaffected
-        Index(
-            "uq_credit_tx_user_idempotency_key",
-            "user_id",
-            "idempotency_key",
-            unique=True,
-        ),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -69,12 +68,49 @@ class CreditTransaction(Base):
     payment_intent_id: Mapped[str | None] = mapped_column(
         String, index=True, default=None
     )
-    # caller-supplied Idempotency-Key; the unique index (in __table_args__, with
-    # a fixed name the migration also uses) makes a retried charge or grant
-    # return the first result instead of applying twice
-    idempotency_key: Mapped[str | None] = mapped_column(String, default=None)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(UTC)
     )
 
     user: Mapped[User] = relationship(back_populates="transactions")
+
+
+class IdempotencyRecord(Base):
+    """A stored HTTP response, keyed by caller and Idempotency-Key.
+
+    An ``Idempotency-Key`` header makes a mutating request safe to retry: the
+    first request runs and its response is captured here; any later request with
+    the same key from the same caller returns this stored response verbatim
+    without re-running the handler — so a retried charge or grant applies exactly
+    once. Scoped by ``api_key_hash`` (the caller), so one caller can never replay
+    another's key. ``request_fingerprint`` guards against reusing a key for a
+    materially different request (method, path, or body), which returns a 409.
+    """
+
+    __tablename__ = "idempotency_records"
+    __table_args__ = (
+        # one row per (caller, key); the unique index is what serializes a
+        # concurrent first-and-retry race down to a single owner
+        Index(
+            "uq_idempotency_caller_key",
+            "api_key_hash",
+            "idempotency_key",
+            unique=True,
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    # SHA-256 of the caller's API key — identifies the caller without storing the
+    # key, and scopes idempotency keys per caller
+    api_key_hash: Mapped[str] = mapped_column(String, index=True)
+    idempotency_key: Mapped[str] = mapped_column(String)
+    # SHA-256 of method + path + query + body; a mismatch on replay is a 409
+    request_fingerprint: Mapped[str] = mapped_column(String)
+    # False while the first request is in flight; True once its response is stored
+    completed: Mapped[bool] = mapped_column(default=False)
+    status_code: Mapped[int | None] = mapped_column(default=None)
+    response_body: Mapped[bytes | None] = mapped_column(LargeBinary, default=None)
+    response_media_type: Mapped[str | None] = mapped_column(String, default=None)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(UTC)
+    )

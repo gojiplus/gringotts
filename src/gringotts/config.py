@@ -86,6 +86,15 @@ class GringottsConfig:
         cancel_url: Where Checkout returns on cancel; defaults to the buy page
             with ``?status=cancelled``.
         mount_path: URL prefix the routes mount under (default ``/gringotts``).
+        idempotency_enabled: Whether to install the response-caching idempotency
+            middleware so an ``Idempotency-Key`` header makes a request safe to
+            retry (default ``True``).
+        idempotency_header: The header carrying the idempotency key (default
+            ``"Idempotency-Key"``).
+        idempotency_max_key_length: Reject a key longer than this with ``400``
+            (default ``255``).
+        idempotency_in_progress_ttl: Seconds after which an in-flight record whose
+            owner appears to have crashed becomes reclaimable (default ``90``).
     """
 
     packs: list[CreditPack] = field(default_factory=list)
@@ -94,6 +103,10 @@ class GringottsConfig:
     success_url: str | None = None
     cancel_url: str | None = None
     mount_path: str = "/gringotts"
+    idempotency_enabled: bool = True
+    idempotency_header: str = "Idempotency-Key"
+    idempotency_max_key_length: int = 255
+    idempotency_in_progress_ttl: float = 90.0
 
     def __post_init__(self) -> None:
         """Fill Stripe credentials from env and require one currency across packs."""

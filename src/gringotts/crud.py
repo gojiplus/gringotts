@@ -1,6 +1,5 @@
 """Database operations: users, atomic credit movements, and ledger queries."""
 
-import enum
 import logging
 
 from sqlalchemy import case, func
@@ -10,54 +9,6 @@ from sqlalchemy.orm import Session
 from . import auth, models
 
 logger = logging.getLogger(__name__)
-
-
-class ChargeResult(enum.Enum):
-    """Outcome of :func:`charge_user`.
-
-    ``CHARGED`` means this call debited the balance (and must be refunded if the
-    request then fails); ``REPLAYED`` means an idempotent retry matched a prior
-    charge and nothing was debited (so it must *not* be refunded); ``INSUFFICIENT``
-    means too few credits; ``CONFLICT`` means the ``idempotency_key`` was reused
-    for a different cost or endpoint.
-    """
-
-    CHARGED = "charged"
-    REPLAYED = "replayed"
-    INSUFFICIENT = "insufficient"
-    CONFLICT = "conflict"
-
-
-def keyed_row(
-    db: Session, user_id: int, idempotency_key: str
-) -> models.CreditTransaction | None:
-    """Return this user's ledger row for an idempotency key, or None.
-
-    Scoped to ``user_id`` so one caller can never see another's keyed row.
-    """
-    return (
-        db.query(models.CreditTransaction)
-        .filter(
-            models.CreditTransaction.user_id == user_id,
-            models.CreditTransaction.idempotency_key == idempotency_key,
-        )
-        .first()
-    )
-
-
-def release_idempotency_key(db: Session, user_id: int, idempotency_key: str) -> None:
-    """Clear a user's idempotency key from its ledger row so it can be reused.
-
-    Called when a keyed charge is refunded (its handler failed): the debit was
-    compensated, so a retry with the same key must charge fresh rather than
-    replay — otherwise a later successful retry would deliver paid work for free.
-    Only the operational key is cleared; the ledger amounts stay immutable.
-    """
-    db.query(models.CreditTransaction).filter(
-        models.CreditTransaction.user_id == user_id,
-        models.CreditTransaction.idempotency_key == idempotency_key,
-    ).update({models.CreditTransaction.idempotency_key: None})
-    db.commit()
 
 
 def create_user(
@@ -111,39 +62,20 @@ def charge_user(
     user: models.User,
     cost: int,
     endpoint: str | None = None,
-    idempotency_key: str | None = None,
-) -> ChargeResult:
-    """Atomically deduct `cost` if the balance suffices, returning a `ChargeResult`.
+) -> bool:
+    """Atomically deduct `cost` if the balance suffices; return whether it did.
 
-    The ledger row is written in the same transaction as the balance update. A
-    `cost` of 0 is a no-op reported as ``CHARGED``; a negative `cost` raises
-    ValueError, since a charge must never raise a balance. When `idempotency_key`
-    is given (scoped to this user), a retry with the same key charges only once:
-    a matching retry returns ``REPLAYED`` without deducting, and reusing the key
-    for a different cost or endpoint returns ``CONFLICT``.
+    The ledger row is written in the same transaction as the balance update, via
+    a compare-and-set `UPDATE ... WHERE credits >= cost` so two concurrent charges
+    can't both pass a stale balance check. A `cost` of 0 is a no-op that returns
+    True and writes no row; a negative `cost` raises ValueError, since a charge
+    must never raise a balance. Safe retries are handled one layer up by
+    :class:`~gringotts.idempotency.IdempotencyMiddleware`, not here.
     """
     if cost < 0:
         raise ValueError("charge cost cannot be negative")
     if cost == 0:
-        return ChargeResult.CHARGED
-
-    def _classify_prior() -> ChargeResult | None:
-        # REPLAYED if a matching prior charge exists, CONFLICT if it exists with
-        # a different cost/endpoint, None if no prior row for this key. Applied at
-        # the precheck AND in both race handlers, so a concurrent same-key retry
-        # for a different operation can't slip past as a plain replay.
-        if idempotency_key is None:
-            return None
-        prior = keyed_row(db, user.id, idempotency_key)
-        if prior is None:
-            return None
-        if prior.amount != -cost or prior.endpoint != endpoint:
-            return ChargeResult.CONFLICT
-        return ChargeResult.REPLAYED
-
-    precheck = _classify_prior()
-    if precheck is not None:
-        return precheck
+        return True
     updated = (
         db.query(models.User)
         .filter(models.User.id == user.id, models.User.credits >= cost)
@@ -152,10 +84,7 @@ def charge_user(
     if not updated:
         db.rollback()
         db.refresh(user)
-        # A concurrent same-key winner may have charged after our precheck; if so
-        # this is a replay (or a conflict), not a genuine 402.
-        raced = _classify_prior()
-        return raced if raced is not None else ChargeResult.INSUFFICIENT
+        return False
     db.refresh(user)  # balance after the debit, our own in-transaction write
     db.add(
         models.CreditTransaction(
@@ -163,22 +92,12 @@ def charge_user(
             amount=-cost,
             kind="charge",
             endpoint=endpoint,
-            idempotency_key=idempotency_key,
             balance_after=user.credits,
         )
     )
-    try:
-        db.commit()
-    except IntegrityError:
-        # a concurrent retry with the same key won the race and charged already
-        db.rollback()
-        db.refresh(user)
-        raced = _classify_prior()
-        if raced is not None:
-            return raced
-        raise
+    db.commit()
     db.refresh(user)
-    return ChargeResult.CHARGED
+    return True
 
 
 def refund_user(
@@ -219,18 +138,16 @@ def grant_credits(
     external_id: str | None = None,
     amount_cents: int | None = None,
     payment_intent_id: str | None = None,
-    idempotency_key: str | None = None,
 ) -> bool:
     """Atomically add credits with a ledger row.
 
-    Returns False when `external_id` or `idempotency_key` was already processed,
-    making event-driven or retried crediting idempotent. A negative `amount`
-    raises ValueError, since a grant must never deduct.
+    Returns False when `external_id` was already processed, making event-driven
+    crediting (Stripe webhooks) idempotent. A negative `amount` raises ValueError,
+    since a grant must never deduct. HTTP-level safe-retry for the admin grant
+    route is handled by :class:`~gringotts.idempotency.IdempotencyMiddleware`.
     """
     if amount < 0:
         raise ValueError("grant amount cannot be negative")
-    if idempotency_key is not None and keyed_row(db, user.id, idempotency_key):
-        return False  # already granted under this key
     db.query(models.User).filter(models.User.id == user.id).update(
         {models.User.credits: models.User.credits + amount}
     )
@@ -243,7 +160,6 @@ def grant_credits(
             external_id=external_id,
             amount_cents=amount_cents,
             payment_intent_id=payment_intent_id,
-            idempotency_key=idempotency_key,
             balance_after=user.credits,
         )
     )
@@ -251,12 +167,10 @@ def grant_credits(
         db.commit()
     except IntegrityError:
         db.rollback()
-        # A duplicate external_id or idempotency_key means "already processed"
-        # (idempotent replay). Any other integrity failure is a real error we
-        # must not swallow, or a valid grant would vanish silently.
+        # A duplicate external_id means "already processed" (idempotent replay).
+        # Any other integrity failure is a real error we must not swallow, or a
+        # valid grant would vanish silently.
         if external_id is not None and external_id_exists(db, external_id):
-            return False
-        if idempotency_key is not None and keyed_row(db, user.id, idempotency_key):
             return False
         raise
     db.refresh(user)

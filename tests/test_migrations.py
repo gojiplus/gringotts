@@ -71,18 +71,18 @@ def test_migrate_backfills_balance_after(tmp_path):
         engine.dispose()
 
 
-def test_migrate_adds_payment_intent_id(tmp_path):
+def test_migrate_adds_payment_intent_id_and_idempotency_records(tmp_path):
     engine = _legacy_db(tmp_path)
     try:
         migrations.run_pending(engine)
         with engine.connect() as conn:
             insp = inspect(conn)
             cols = {c["name"] for c in insp.get_columns("credit_transactions")}
-            indexes = {i["name"] for i in insp.get_indexes("credit_transactions")}
+            tables = set(insp.get_table_names())
         assert "payment_intent_id" in cols
         assert "balance_after" in cols
-        assert "idempotency_key" in cols
-        assert "uq_credit_tx_user_idempotency_key" in indexes
+        # response-caching idempotency lives in its own table now
+        assert "idempotency_records" in tables
     finally:
         engine.dispose()
 

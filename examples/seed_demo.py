@@ -42,11 +42,8 @@ def main() -> None:
             keys[name] = key
             for _ in range(rng.randint(15, 40)):
                 cost = rng.choice([1, 1, 1, 2, 5])
-                charged = (
-                    crud.charge_user(
-                        session, user, cost, endpoint=rng.choice(ENDPOINTS)
-                    )
-                    is crud.ChargeResult.CHARGED
+                charged = crud.charge_user(
+                    session, user, cost, endpoint=rng.choice(ENDPOINTS)
                 )
                 if charged and rng.random() < 0.05:
                     crud.refund_user(

@@ -6,6 +6,7 @@ from fastapi.responses import JSONResponse
 from .admin import build_admin_router
 from .config import GringottsConfig
 from .exceptions import PaymentRequiredError, payment_required_body
+from .idempotency import IdempotencyMiddleware
 from .router import build_router
 
 
@@ -34,6 +35,16 @@ def init_app(app: FastAPI, config: GringottsConfig | None = None) -> None:
     """
     cfg = config or GringottsConfig()
     app.state.gringotts = cfg
+
+    if cfg.idempotency_enabled:
+        # Wraps the whole app: an Idempotency-Key request short-circuits to its
+        # stored response on replay, so the handler (and its charge) runs once.
+        app.add_middleware(
+            IdempotencyMiddleware,
+            header=cfg.idempotency_header,
+            max_key_length=cfg.idempotency_max_key_length,
+            in_progress_ttl=cfg.idempotency_in_progress_ttl,
+        )
 
     async def handle_payment_required(request: Request, exc: PaymentRequiredError):
         purchase_url = None

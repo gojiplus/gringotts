@@ -8,22 +8,34 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
-- **Idempotency keys on mutating operations.** Pass an `Idempotency-Key` header to
-  a `charge()`-guarded endpoint or to the admin grant route (or `--idempotency-key`
-  to `gringotts add-credits`), and a retried request applies **at most once** — the
-  repeat returns the first result instead of charging or granting again, safe even
-  under concurrent delivery. Keys are **scoped per user**, so one caller can't reuse
-  another's key to skip payment; reusing a key for a different cost or endpoint
-  returns `409 Conflict`. Backed by a new per-user-unique `idempotency_key` column
-  on the ledger (applied by `gringotts migrate`). Requests without a key behave as
-  before.
+- **Response-caching idempotency.** Send an `Idempotency-Key` header with any
+  mutating request (a `charge()`-guarded endpoint, the admin grant route, anything
+  the app serves) and a retry applies **exactly once**: the first request runs and
+  its response is stored; a later request with the same key from the same caller
+  gets that stored response back **verbatim, without re-running the handler** — so
+  the charge, and any other side effect in the handler, happens once. Because the
+  replay short-circuits above the route, a retry can never double-charge, re-run the
+  handler for free, or race the original's refund.
+  - Keys are **scoped to the caller** (the API key), so one caller can't replay
+    another's key.
+  - Reusing a key for a materially different request (method, path, or body) returns
+    `409 Conflict`; a replay carries an `Idempotent-Replayed: true` header.
+  - A **5xx or unhandled error is not cached** — it's transient, so the key is
+    released and a genuine retry re-attempts. A `4xx` (including a `402` for
+    insufficient credits) *is* cached; use a fresh key for a fresh attempt.
+  - A crashed in-flight request holds the key (concurrent duplicates get `409`) and
+    becomes reclaimable after `idempotency_in_progress_ttl`, so a crash can't lock a
+    key forever.
+  - Configurable via `GringottsConfig`: `idempotency_enabled` (default on),
+    `idempotency_header`, `idempotency_max_key_length`, `idempotency_in_progress_ttl`.
+  - Backed by a new `idempotency_records` table (applied by `gringotts migrate`).
 - Curated documentation site: a grouped API reference, documented config fields,
   usage examples, and new guides (Quickstart, How it works, Stripe & webhooks,
   Examples).
 
 ### Upgrading
 
-- Run `gringotts migrate` to add the `idempotency_key` column and its unique index.
+- Run `gringotts migrate` to create the `idempotency_records` table.
 
 ## [0.3.0] - 2026-08-15
 
