@@ -246,13 +246,7 @@ class IdempotencyMiddleware:
         try:
             await self.app(scope, replay_receive, send_wrapper)
         except Exception:
-            if captured["started"]:
-                # The response already began, so the charge is committed and the
-                # client got (most of) its result — e.g. a BackgroundTask or a
-                # send() raised after the handler returned. Deleting the key would
-                # let a retry re-charge, so cache the outcome and keep it locked.
-                await run_in_threadpool(self._persist, record_id, captured)
-            else:
+            if not captured["started"]:
                 # The handler raised before responding. Under the documented pattern
                 # (Depends(charge())) that is refunded by the dependency, so release
                 # the key for a genuine retry; ServerErrorMiddleware (outside us)
@@ -260,13 +254,26 @@ class IdempotencyMiddleware:
                 # is a BaseException, so it isn't caught here — the record stays and
                 # the retry gets 409 rather than risking a re-charge.
                 await run_in_threadpool(self._delete, record_id)
+            else:
+                # The response already began (e.g. a BackgroundTask raised after the
+                # handler returned, or a stream broke mid-body): the client got
+                # (most of) its result, so cache the outcome and keep the key locked
+                # rather than let a retry re-run the handler.
+                await run_in_threadpool(self._persist, record_id, captured)
             raise
 
-        # The handler RETURNED (any status, 5xx included). gringotts charges before
-        # the handler runs, so whatever it returns, the side effect is committed and
-        # not rolled back — cache the outcome so a retry can't run it again. Only a
-        # pre-response raised exception (above) releases the key.
-        await run_in_threadpool(self._persist, record_id, captured)
+        # The handler RETURNED. If the charge dependency refunded (e.g. it raised
+        # an HTTPException that the exception middleware turned into a 5xx), that is
+        # a transient failure — release the key so a retry re-attempts. Otherwise
+        # the side effect is committed, so cache the outcome (a retry can't re-run
+        # it). A FastAPI slash-redirect ran no handler at all, so release its key so
+        # the client can follow the redirect under the new path's fingerprint.
+        if _refunded(scope) or _is_slash_redirect(
+            captured["status"], captured["headers"], scope["path"]
+        ):
+            await run_in_threadpool(self._delete, record_id)
+        else:
+            await run_in_threadpool(self._persist, record_id, captured)
 
     async def _read_body(self, receive):
         """Drain the request body, bounded, detecting a mid-upload disconnect.
@@ -525,6 +532,37 @@ def _dump_headers(headers, extra=None) -> str:
 def _is_bodyless(status: int) -> bool:
     """Whether an HTTP status forbids a response body (204, 304, 1xx)."""
     return status in (204, 304) or 100 <= status < 200
+
+
+def _refunded(scope) -> bool:
+    """Whether the charge dependency signalled it refunded this request."""
+    return bool(scope.get("gringotts_idempotency", {}).get("refunded"))
+
+
+def _is_slash_redirect(status: int, headers, path: str) -> bool:
+    """Whether this is FastAPI's automatic add/remove-trailing-slash redirect.
+
+    Such a redirect is issued by the router *before* the endpoint runs (so no
+    charge happened) and points at the same path with the slash toggled. Caching
+    it would make the client's redirect-follow — same key, the other path, a
+    different fingerprint — collide as a 409. Matched narrowly so a handler's own
+    redirect elsewhere is still cached.
+    """
+    if status not in (307, 308):
+        return False
+    loc = None
+    for name, value in headers:
+        if name.lower() == b"location":
+            loc = value.decode("latin-1")
+            break
+    if loc is None:
+        return False
+    loc_path = loc.split("?", 1)[0]
+    if "://" in loc_path:  # strip scheme://host, leaving the path
+        rest = loc_path.split("://", 1)[1]
+        loc_path = "/" + rest.split("/", 1)[1] if "/" in rest else "/"
+    # same path modulo a toggled trailing slash (not an identical URL)
+    return loc_path != path and loc_path.rstrip("/") == path.rstrip("/")
 
 
 def _has_no_store(headers) -> bool:

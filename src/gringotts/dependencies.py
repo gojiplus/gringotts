@@ -83,6 +83,13 @@ def charge(cost: CostSpec) -> Callable[..., Iterator[User]]:
                 # GeneratorExit is deliberately not caught: it fires on normal
                 # close and must not trigger a refund.
                 _refund_on_fresh_session(user_id, amount, endpoint)
+                # Tell IdempotencyMiddleware the charge was refunded (net zero), so
+                # it releases the key even when the exception is later turned into a
+                # returned response (e.g. HTTPException(503)) — that request is a
+                # transient failure and a retry must be able to re-attempt.
+                scope = getattr(request, "scope", None)
+                if scope is not None:
+                    scope.setdefault("gringotts_idempotency", {})["refunded"] = True
                 raise
         finally:
             session.close()

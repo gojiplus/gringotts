@@ -564,6 +564,51 @@ def test_prune_retains_in_flight_by_default(db_session):
     assert db_session.query(models.IdempotencyRecord).count() == 0
 
 
+def test_httpexception_5xx_releases_key(db_session):
+    # a handler that raises HTTPException(503) is refunded by charge(); the 5xx is
+    # a transient failure, so the key must be released for a retry to re-attempt
+    from fastapi import HTTPException
+
+    app = FastAPI()
+    gringotts.init_app(app, GringottsConfig())
+    calls = {"n": 0}
+
+    @app.get("/svc")
+    def svc(user: CreditedUser = Depends(charge(2))):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise HTTPException(status_code=503, detail="transient")
+        return {"ok": True}
+
+    user, key = auth.create_user_with_key(db_session, "sv", credits=10)
+    client = TestClient(app)
+    h = {"X-API-Key": key, "Idempotency-Key": "svk"}
+    assert client.get("/svc", headers=h).status_code == 503  # refunded, key released
+    assert client.get("/svc", headers=h).status_code == 200  # retry re-attempts
+    db_session.refresh(user)
+    assert user.credits == 8  # charged once, for the successful retry
+
+
+def test_slash_redirect_does_not_conflict(db_session):
+    # FastAPI auto-redirects POST /x -> /x/; the client follows with the same key,
+    # and the redirect must not be cached as a conflicting key reuse
+    app = FastAPI()
+    gringotts.init_app(app, GringottsConfig())
+
+    @app.post("/x/")
+    def x(user: CreditedUser = Depends(charge(2))):
+        return {"ok": True}
+
+    user, key = auth.create_user_with_key(db_session, "sr", credits=10)
+    client = TestClient(app)
+    h = {"X-API-Key": key, "Idempotency-Key": "srk"}
+    r = client.post("/x", headers=h, follow_redirects=True)
+    assert r.status_code == 200  # followed the 307 to /x/, not a 409
+    assert r.json() == {"ok": True}
+    db_session.refresh(user)
+    assert user.credits == 8  # charged once at /x/
+
+
 def test_fingerprint_no_collision_with_null_bytes():
     # length-prefixing must make the encoding injective: two materially different
     # requests (query/body split differently around a null byte) can't collide
