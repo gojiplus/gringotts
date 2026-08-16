@@ -19,6 +19,7 @@ CreditedUser = User
 CostSpec = int | Callable[[Request], int]
 
 API_KEY_HEADER = "X-API-Key"
+IDEMPOTENCY_HEADER = "Idempotency-Key"
 
 
 def authenticate(db: Session, api_key: str | None) -> User:
@@ -71,7 +72,11 @@ def charge(cost: CostSpec) -> Callable[..., Iterator[User]]:
             if amount < 0:
                 raise HTTPException(status_code=400, detail="Invalid credit cost")
             endpoint = request.url.path
-            if not crud.charge_user(session, user, amount, endpoint=endpoint):
+            # An optional Idempotency-Key makes a retried request charge once.
+            key = request.headers.get(IDEMPOTENCY_HEADER)
+            if not crud.charge_user(
+                session, user, amount, endpoint=endpoint, idempotency_key=key
+            ):
                 raise PaymentRequiredError(cost=amount, balance=user.credits)
             user_id = user.id
             try:

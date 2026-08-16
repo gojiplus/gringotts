@@ -35,6 +35,22 @@ with SessionLocal() as db:
     grant(db, user, 100, kind="promo", external_id="signup-bonus-42")
 ```
 
+## Idempotent requests
+
+Pass an `Idempotency-Key` header and a retried request is applied at most once —
+the repeat returns the first result instead of charging again:
+
+```bash
+# both calls together charge once
+curl -X POST localhost:8000/predict \
+  -H "X-API-Key: gk_..." -H "Idempotency-Key: order-42"
+curl -X POST localhost:8000/predict \
+  -H "X-API-Key: gk_..." -H "Idempotency-Key: order-42"
+```
+
+The same works for the admin grant route and, from the CLI, `gringotts
+add-credits <user> <n> --idempotency-key <key>`.
+
 ## Admin API
 
 Any user with the admin flag can manage users and credits over HTTP (JSON for

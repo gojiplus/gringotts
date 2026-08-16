@@ -58,19 +58,27 @@ def get_user_by_api_key(db: Session, api_key: str) -> models.User | None:
 
 
 def charge_user(
-    db: Session, user: models.User, cost: int, endpoint: str | None = None
+    db: Session,
+    user: models.User,
+    cost: int,
+    endpoint: str | None = None,
+    idempotency_key: str | None = None,
 ) -> bool:
     """Atomically deduct `cost` if the balance suffices.
 
     The ledger row is written in the same transaction as the balance update.
     Returns False (and leaves the balance untouched) when credits are short.
     A `cost` of 0 is a no-op that succeeds without a ledger row; a negative
-    `cost` raises ValueError, since a charge must never raise a balance.
+    `cost` raises ValueError, since a charge must never raise a balance. When
+    `idempotency_key` is given, a retry with the same key charges only once and
+    returns True without deducting again.
     """
     if cost < 0:
         raise ValueError("charge cost cannot be negative")
     if cost == 0:
         return True
+    if idempotency_key is not None and idempotency_key_exists(db, idempotency_key):
+        return True  # already charged under this key
     updated = (
         db.query(models.User)
         .filter(models.User.id == user.id, models.User.credits >= cost)
@@ -87,10 +95,19 @@ def charge_user(
             amount=-cost,
             kind="charge",
             endpoint=endpoint,
+            idempotency_key=idempotency_key,
             balance_after=user.credits,
         )
     )
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        # a concurrent retry with the same key won the race and charged already
+        db.rollback()
+        db.refresh(user)
+        if idempotency_key is not None and idempotency_key_exists(db, idempotency_key):
+            return True
+        raise
     db.refresh(user)
     return True
 
@@ -133,15 +150,18 @@ def grant_credits(
     external_id: str | None = None,
     amount_cents: int | None = None,
     payment_intent_id: str | None = None,
+    idempotency_key: str | None = None,
 ) -> bool:
     """Atomically add credits with a ledger row.
 
-    Returns False when `external_id` was already processed, making
-    event-driven crediting (e.g. Stripe webhooks) idempotent. A negative
-    `amount` raises ValueError, since a grant must never deduct.
+    Returns False when `external_id` or `idempotency_key` was already processed,
+    making event-driven or retried crediting idempotent. A negative `amount`
+    raises ValueError, since a grant must never deduct.
     """
     if amount < 0:
         raise ValueError("grant amount cannot be negative")
+    if idempotency_key is not None and idempotency_key_exists(db, idempotency_key):
+        return False  # already granted under this key
     db.query(models.User).filter(models.User.id == user.id).update(
         {models.User.credits: models.User.credits + amount}
     )
@@ -154,6 +174,7 @@ def grant_credits(
             external_id=external_id,
             amount_cents=amount_cents,
             payment_intent_id=payment_intent_id,
+            idempotency_key=idempotency_key,
             balance_after=user.credits,
         )
     )
@@ -161,10 +182,12 @@ def grant_credits(
         db.commit()
     except IntegrityError:
         db.rollback()
-        # Only a duplicate external_id means "already processed" (idempotent
-        # replay). Any other integrity failure is a real error we must not
-        # swallow, or a valid grant would vanish silently.
+        # A duplicate external_id or idempotency_key means "already processed"
+        # (idempotent replay). Any other integrity failure is a real error we
+        # must not swallow, or a valid grant would vanish silently.
         if external_id is not None and external_id_exists(db, external_id):
+            return False
+        if idempotency_key is not None and idempotency_key_exists(db, idempotency_key):
             return False
         raise
     db.refresh(user)
@@ -176,6 +199,16 @@ def external_id_exists(db: Session, external_id: str) -> bool:
     return (
         db.query(models.CreditTransaction.id)
         .filter(models.CreditTransaction.external_id == external_id)
+        .first()
+        is not None
+    )
+
+
+def idempotency_key_exists(db: Session, idempotency_key: str) -> bool:
+    """Whether a ledger row already carries this idempotency key."""
+    return (
+        db.query(models.CreditTransaction.id)
+        .filter(models.CreditTransaction.idempotency_key == idempotency_key)
         .first()
         is not None
     )

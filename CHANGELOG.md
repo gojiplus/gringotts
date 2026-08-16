@@ -4,6 +4,24 @@ All notable changes to this project are documented in this file. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-08-16
+
+### Added
+
+- **Idempotency keys on mutating operations.** Pass an `Idempotency-Key` header to
+  a `charge()`-guarded endpoint or to the admin grant route (or `--idempotency-key`
+  to `gringotts add-credits`), and a retried request applies **at most once** — the
+  repeat returns the first result instead of charging or granting again, safe even
+  under concurrent delivery. Backed by a new unique `idempotency_key` column on the
+  ledger (applied by `gringotts migrate`). Requests without a key behave as before.
+- Curated documentation site: a grouped API reference, documented config fields,
+  usage examples, and new guides (Quickstart, How it works, Stripe & webhooks,
+  Examples).
+
+### Upgrading
+
+- Run `gringotts migrate` to add the `idempotency_key` column and its unique index.
+
 ## [0.3.0] - 2026-08-15
 
 Correct money accounting: refunds and disputes now reverse the credits they

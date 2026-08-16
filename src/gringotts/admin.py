@@ -153,7 +153,10 @@ def build_admin_router(config: GringottsConfig) -> APIRouter:
         user = crud.get_user(db, user_id)
         if user is None:
             raise HTTPException(status_code=404, detail="User not found")
-        crud.grant_credits(db, user, amount)
+        # An optional Idempotency-Key makes a retried grant apply once.
+        key = request.headers.get("Idempotency-Key")
+        crud.grant_credits(db, user, amount, idempotency_key=key)
+        db.refresh(user)
         if not _is_htmx(request):
             return JSONResponse({"id": user.id, "balance": user.credits})
         return users(request, admin, db)

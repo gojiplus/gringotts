@@ -76,9 +76,13 @@ def test_migrate_adds_payment_intent_id(tmp_path):
     try:
         migrations.run_pending(engine)
         with engine.connect() as conn:
-            cols = {c["name"] for c in inspect(conn).get_columns("credit_transactions")}
+            insp = inspect(conn)
+            cols = {c["name"] for c in insp.get_columns("credit_transactions")}
+            indexes = {i["name"] for i in insp.get_indexes("credit_transactions")}
         assert "payment_intent_id" in cols
         assert "balance_after" in cols
+        assert "idempotency_key" in cols
+        assert "uq_credit_tx_idempotency_key" in indexes
     finally:
         engine.dispose()
 

@@ -42,9 +42,10 @@ your purchase page; Stripe Checkout tops them up.
   network calls, no rev share, no vendor that can shut down under you.
 - **Correct where it's hard to be**: atomic credit deduction (no overspend under
   concurrency), automatic refund when your handler raises, idempotent webhook
-  crediting, refund/dispute clawback (clamped so a balance never goes negative),
-  and an append-only ledger — with a per-row running balance — auditing every
-  credit movement.
+  crediting, optional `Idempotency-Key` so retried charges/grants apply once,
+  refund/dispute clawback (clamped so a balance never goes negative), and an
+  append-only ledger — with a per-row running balance — auditing every credit
+  movement.
 - **Agent-ready 402**: the insufficient-credits response is typed JSON
   (x402-compatible vocabulary), so AI-agent clients can parse it and pay.
 

@@ -113,9 +113,25 @@ def _add_payment_intent_id(conn) -> None:
     )
 
 
+def _add_idempotency_key(conn) -> None:
+    if not _has_column(conn, "credit_transactions", "idempotency_key"):
+        conn.execute(
+            text("ALTER TABLE credit_transactions ADD COLUMN idempotency_key VARCHAR")
+        )
+    # SQLite can't ADD a UNIQUE column, but a unique index after the fact is fine
+    # on both backends; NULLs don't collide, so existing rows are unaffected.
+    conn.execute(
+        text(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_credit_tx_idempotency_key "
+            "ON credit_transactions (idempotency_key)"
+        )
+    )
+
+
 STEPS: list[tuple[int, str, Callable]] = [
     (1, "add balance_after running-balance to credit_transactions", _add_balance_after),
     (2, "add payment_intent_id to credit_transactions", _add_payment_intent_id),
+    (3, "add idempotency_key to credit_transactions", _add_idempotency_key),
 ]
 
 HEAD = STEPS[-1][0] if STEPS else 0

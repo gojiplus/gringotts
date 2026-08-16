@@ -2,7 +2,7 @@
 
 from datetime import UTC, datetime
 
-from sqlalchemy import CheckConstraint, DateTime, ForeignKey, String
+from sqlalchemy import CheckConstraint, DateTime, ForeignKey, Index, String
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .db import Base
@@ -41,6 +41,11 @@ class CreditTransaction(Base):
     # the ledger is self-verifying rather than only reconciled against a cache.
     __table_args__ = (
         CheckConstraint("balance_after >= 0", name="ck_credit_tx_balance_nonneg"),
+        Index(
+            "uq_credit_tx_idempotency_key",
+            "idempotency_key",
+            unique=True,
+        ),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -61,6 +66,10 @@ class CreditTransaction(Base):
     payment_intent_id: Mapped[str | None] = mapped_column(
         String, index=True, default=None
     )
+    # caller-supplied Idempotency-Key; the unique index (in __table_args__, with
+    # a fixed name the migration also uses) makes a retried charge or grant
+    # return the first result instead of applying twice
+    idempotency_key: Mapped[str | None] = mapped_column(String, default=None)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(UTC)
     )
