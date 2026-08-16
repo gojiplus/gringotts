@@ -414,7 +414,36 @@ def test_read_body_flags_overflow():
 
     body, state = asyncio.run(mw._read_body(receive))
     assert state == "overflow"
-    assert body == b"12345"
+    assert body == b""  # oversized body isn't buffered — the request is rejected
+
+
+def test_background_task_failure_keeps_lock(db_session):
+    # a handler returns 200 (charge committed, response sent) then its background
+    # task raises; the middleware must NOT release the key, or a retry re-charges
+    from fastapi.responses import JSONResponse
+    from starlette.background import BackgroundTask
+
+    app = FastAPI()
+    gringotts.init_app(app, GringottsConfig())
+    ran = {"n": 0}
+
+    def boom():
+        raise RuntimeError("background failure")
+
+    @app.get("/bg")
+    def bg(user: CreditedUser = Depends(charge(2))):
+        ran["n"] += 1
+        return JSONResponse({"ok": True}, background=BackgroundTask(boom))
+
+    _, key = auth.create_user_with_key(db_session, "bgk", credits=10)
+    client = TestClient(app, raise_server_exceptions=False)
+    h = {"X-API-Key": key, "Idempotency-Key": "bgk1"}
+    client.get("/bg", headers=h)  # 200 returned, then background task raises
+    client.get("/bg", headers=h)  # must replay, not re-run the handler
+    # The response already started, so the key is kept (cached) rather than
+    # released: the retry replays instead of re-running. With the old
+    # delete-on-any-exception this ran twice (a double execution).
+    assert ran["n"] == 1
 
 
 def test_streaming_response_is_cached_without_hang(db_session):

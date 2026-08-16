@@ -28,7 +28,9 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     through uncached) and **expire** after `idempotency_retention_seconds`.
   - An **in-flight or crashed** request is never auto-re-run — a duplicate or a
     retry of an unknown outcome gets `409`, because age can't prove the first
-    attempt didn't already charge. `gringotts prune-idempotency` clears old records.
+    attempt didn't already charge. A reused key expires lazily; to bound table
+    growth from keys that are never retried, schedule `gringotts prune-idempotency`
+    (e.g. a daily cron).
   - Configurable via `GringottsConfig`: `idempotency_enabled` (default on),
     `idempotency_header`, `idempotency_max_key_length`, `idempotency_max_body_bytes`,
     `idempotency_max_response_bytes`, `idempotency_retention_seconds`.

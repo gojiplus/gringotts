@@ -70,9 +70,6 @@ _BODY_TOO_LARGE_BODY = json.dumps(
 _TRUNCATED_BODY = json.dumps(
     {"detail": "The request was processed; its response was too large to cache."}
 ).encode()
-_TRUNCATED_HEADERS = json.dumps(
-    [["content-type", "application/json"], ["idempotent-response-truncated", "true"]]
-)
 
 
 def _fingerprint(method: str, path: str, query: bytes, body: bytes) -> str:
@@ -195,10 +192,17 @@ class IdempotencyMiddleware:
                 return {"type": "http.request", "body": body, "more_body": False}
             return await receive()
 
-        captured = {"status": 500, "headers": [], "body": bytearray(), "too_big": False}
+        captured = {
+            "status": 500,
+            "headers": [],
+            "body": bytearray(),
+            "too_big": False,
+            "started": False,
+        }
 
         async def send_wrapper(message):
             if message["type"] == "http.response.start":
+                captured["started"] = True
                 captured["status"] = message["status"]
                 captured["headers"] = message["headers"]
             elif message["type"] == "http.response.body":
@@ -216,39 +220,27 @@ class IdempotencyMiddleware:
         try:
             await self.app(scope, replay_receive, send_wrapper)
         except Exception:
-            # The handler RAISED. Under the documented pattern (Depends(charge()))
-            # a raised exception is refunded by the dependency, so the key is safe
-            # to release for a genuine retry; then ServerErrorMiddleware (outside
-            # us) produces the 500. A CancelledError from a client disconnect is
-            # deliberately NOT caught here — the charge may have committed as the
-            # response streamed, so re-running could double-charge; the record
-            # stays and the retry gets 409 until expiry.
-            await run_in_threadpool(self._delete, record_id)
+            if captured["started"]:
+                # The response already began, so the charge is committed and the
+                # client got (most of) its result — e.g. a BackgroundTask or a
+                # send() raised after the handler returned. Deleting the key would
+                # let a retry re-charge, so cache the outcome and keep it locked.
+                await run_in_threadpool(self._persist, record_id, captured)
+            else:
+                # The handler raised before responding. Under the documented pattern
+                # (Depends(charge())) that is refunded by the dependency, so release
+                # the key for a genuine retry; ServerErrorMiddleware (outside us)
+                # then produces the 500. A CancelledError from a client disconnect
+                # is a BaseException, so it isn't caught here — the record stays and
+                # the retry gets 409 rather than risking a re-charge.
+                await run_in_threadpool(self._delete, record_id)
             raise
 
         # The handler RETURNED (any status, 5xx included). gringotts charges before
         # the handler runs, so whatever it returns, the side effect is committed and
         # not rolled back — cache the outcome so a retry can't run it again. Only a
-        # raised exception (above) releases the key.
-        if captured["too_big"]:
-            # Handler ran (and may have charged) but the response is too large to
-            # store: keep the key locked so a retry can't re-charge; a replay gets a
-            # marker in place of the un-cacheable body.
-            await run_in_threadpool(
-                self._store,
-                record_id,
-                captured["status"],
-                _TRUNCATED_BODY,
-                _TRUNCATED_HEADERS,
-            )
-        else:
-            await run_in_threadpool(
-                self._store,
-                record_id,
-                captured["status"],
-                bytes(captured["body"]),
-                _dump_headers(captured["headers"]),
-            )
+        # pre-response raised exception (above) releases the key.
+        await run_in_threadpool(self._persist, record_id, captured)
 
     async def _read_body(self, receive):
         """Drain the request body, bounded, detecting a mid-upload disconnect.
@@ -265,11 +257,14 @@ class IdempotencyMiddleware:
             if message["type"] == "http.disconnect":
                 return b"".join(chunks), "disconnect"
             chunk = message.get("body", b"")
+            # Check the prospective size BEFORE buffering the frame, and don't join
+            # what we hold on overflow — the request is rejected, so the bytes are
+            # never needed, and neither the append nor the join should copy them.
+            if total + len(chunk) > self.max_body_bytes:
+                return b"", "overflow"
             if chunk:
                 chunks.append(chunk)
                 total += len(chunk)
-            if total > self.max_body_bytes:
-                return b"".join(chunks), "overflow"
             if not message.get("more_body", False):
                 return b"".join(chunks), "ok"
 
@@ -316,8 +311,12 @@ class IdempotencyMiddleware:
         try:
             record = self._get(session, api_key_hash, key)
             if record is not None and record.completed and self._expired(record):
-                # A key past its retention is reusable; drop it and start fresh.
-                session.delete(record)
+                # A key past its retention is reusable; drop it and start fresh. Use
+                # a filtered bulk delete (not session.delete) so two concurrent
+                # requests both expiring the same row don't raise StaleDataError.
+                session.query(IdempotencyRecord).filter(
+                    IdempotencyRecord.id == record.id
+                ).delete(synchronize_session=False)
                 session.commit()
                 record = None
             if record is None:
@@ -351,6 +350,39 @@ class IdempotencyMiddleware:
         finally:
             session.close()
 
+    def _persist(self, record_id: int, captured: dict) -> None:
+        """Store a handler's captured response under a record. Worker thread.
+
+        A response too large to cache is stored as a small marker body while
+        keeping the original headers (so a redirect's ``Location`` or a
+        ``Set-Cookie`` still replays) plus an ``idempotent-response-truncated``
+        flag — the point is to keep the key locked so a retry can't re-run a
+        committed side effect, not to reproduce the oversized body.
+        """
+        if captured["too_big"]:
+            # keep side-effect headers (Location, Set-Cookie), but the body is now a
+            # JSON marker, so drop the original content-type and set it to match.
+            kept = [
+                (name, value)
+                for name, value in captured["headers"]
+                if name.lower() not in (b"content-length", b"content-type")
+            ]
+            headers = _dump_headers(
+                kept,
+                extra=[
+                    ("content-type", "application/json"),
+                    ("idempotent-response-truncated", "true"),
+                ],
+            )
+            self._store(record_id, captured["status"], _TRUNCATED_BODY, headers)
+        else:
+            self._store(
+                record_id,
+                captured["status"],
+                bytes(captured["body"]),
+                _dump_headers(captured["headers"]),
+            )
+
     def _store(
         self, record_id: int, status: int, body: bytes, headers_json: str
     ) -> None:
@@ -369,13 +401,17 @@ class IdempotencyMiddleware:
             session.close()
 
     def _delete(self, record_id: int) -> None:
-        """Drop an in-progress record so its key can be retried. Worker thread."""
+        """Drop an in-progress record so its key can be retried. Worker thread.
+
+        A filtered bulk delete (not ``session.delete``) so a concurrent delete of
+        the same row can't raise StaleDataError.
+        """
         session = db.SessionLocal()
         try:
-            record = session.get(IdempotencyRecord, record_id)
-            if record is not None:
-                session.delete(record)
-                session.commit()
+            session.query(IdempotencyRecord).filter(
+                IdempotencyRecord.id == record_id
+            ).delete(synchronize_session=False)
+            session.commit()
         finally:
             session.close()
 
@@ -397,15 +433,19 @@ class IdempotencyMiddleware:
         return (datetime.now(UTC) - created).total_seconds() > self.retention_seconds
 
 
-def _dump_headers(headers) -> str:
-    """JSON-encode an ASGI header list (dropping length, recomputed on replay)."""
-    return json.dumps(
-        [
-            [name.decode("latin-1"), value.decode("latin-1")]
-            for name, value in headers
-            if name.lower() != b"content-length"
-        ]
-    )
+def _dump_headers(headers, extra=None) -> str:
+    """JSON-encode an ASGI header list (dropping length, recomputed on replay).
+
+    `extra` adds extra ``(name, value)`` string pairs after the captured headers.
+    """
+    pairs = [
+        [name.decode("latin-1"), value.decode("latin-1")]
+        for name, value in headers
+        if name.lower() != b"content-length"
+    ]
+    if extra:
+        pairs.extend([list(pair) for pair in extra])
+    return json.dumps(pairs)
 
 
 def _load_headers(headers_json: str | None):
