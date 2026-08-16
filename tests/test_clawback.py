@@ -173,9 +173,98 @@ def test_dispute_warning_events_ignored(db_session):
     assert user.credits == 100  # untouched
 
 
-def test_refund_for_unknown_purchase_is_noop(db_session):
+def test_refund_for_unmatched_purchase_asks_retry(db_session):
+    # out-of-order delivery (or a pre-0.3 purchase): no match yet -> retryable
     client = _client()
     user = _buy(db_session, client, "p7")
-    assert _post(client, _refund_event("pi_UNKNOWN", 500)).status_code == 200
+    assert _post(client, _refund_event("pi_UNKNOWN", 500)).status_code == 503
     db_session.refresh(user)
-    assert user.credits == 100  # no matching purchase -> untouched
+    assert user.credits == 100  # nothing clawed
+
+
+def test_multiple_partial_refunds_do_not_over_claw(db_session):
+    # 5 credits for 3 cents; three 1-cent refunds. Independent rounding would
+    # claw 2+2+2=6; cumulative delta math caps the total at 5.
+    client = _client()
+    user, _ = auth.create_user_with_key(db_session, "p8", credits=0)
+    payload = json.dumps(
+        {
+            "id": "evt_small",
+            "object": "event",
+            "type": "checkout.session.completed",
+            "data": {
+                "object": {
+                    "id": "cs_small",
+                    "object": "checkout.session",
+                    "amount_total": 3,
+                    "payment_status": "paid",
+                    "payment_intent": "pi_small",
+                    "metadata": {"gringotts_user_id": str(user.id), "credits": "5"},
+                }
+            },
+        }
+    ).encode()
+    assert _post(client, payload).status_code == 200
+    for i in range(3):
+        assert (
+            _post(client, _refund_event("pi_small", 1, refund_id=f"re_{i}")).status_code
+            == 200
+        )
+    db_session.refresh(user)
+    assert user.credits == 0  # exactly 5 clawed across the three refunds, not 6
+    assert crud.find_balance_discrepancies(db_session) == []
+
+
+def test_pending_refund_is_not_clawed_until_succeeded(db_session):
+    client = _client()
+    user = _buy(db_session, client, "p9")
+    pending = json.loads(_refund_event("pi_1", 500).decode())
+    pending["data"]["object"]["status"] = "pending"
+    assert _post(client, json.dumps(pending).encode()).status_code == 200
+    db_session.refresh(user)
+    assert user.credits == 100  # not clawed while pending
+    # the same refund flips to succeeded -> now claw
+    succeeded = json.loads(_refund_event("pi_1", 500).decode())
+    succeeded["type"] = "refund.updated"
+    succeeded["data"]["object"]["status"] = "succeeded"
+    assert _post(client, json.dumps(succeeded).encode()).status_code == 200
+    db_session.refresh(user)
+    assert user.credits == 0
+
+
+def test_dispute_is_proportional_after_partial_refund(db_session):
+    client = _client()
+    user = _buy(db_session, client, "pa")  # 100 credits for 500 cents
+    assert _post(client, _refund_event("pi_1", 250)).status_code == 200  # claw 50
+    # dispute the remaining 250 cents -> claw the other 50, total 100 (not 150)
+    dispute = json.loads(
+        _dispute_event("pi_1", "charge.dispute.funds_withdrawn").decode()
+    )
+    dispute["data"]["object"]["amount"] = 250
+    assert _post(client, json.dumps(dispute).encode()).status_code == 200
+    db_session.refresh(user)
+    assert user.credits == 0  # 50 + 50, exactly the granted 100
+    assert crud.find_balance_discrepancies(db_session) == []
+
+
+def test_reinstate_before_withdrawal_asks_retry(db_session):
+    client = _client()
+    user = _buy(db_session, client, "pb")
+    # reinstatement arrives before the withdrawal -> retryable, not lost
+    assert (
+        _post(
+            client, _dispute_event("pi_1", "charge.dispute.funds_reinstated")
+        ).status_code
+        == 503
+    )
+    db_session.refresh(user)
+    assert user.credits == 100
+
+
+def test_purchased_stat_nets_clawbacks(db_session):
+    client = _client()
+    user = _buy(db_session, client, "pc")  # purchased 100
+    assert crud.aggregate_stats(db_session)["credits_purchased"] == 100
+    _post(client, _refund_event("pi_1", 500))  # full refund
+    db_session.refresh(user)
+    assert crud.aggregate_stats(db_session)["credits_purchased"] == 0  # netted
