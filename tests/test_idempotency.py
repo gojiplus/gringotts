@@ -11,11 +11,11 @@ from datetime import UTC, datetime, timedelta
 
 from fastapi import Depends, FastAPI, Response
 from fastapi.testclient import TestClient
-from test_charge import make_app
 
 import gringotts
 from gringotts import CreditedUser, GringottsConfig, auth, charge, crud, models
 from gringotts.idempotency import IdempotencyMiddleware, _fingerprint
+from test_charge import make_app
 
 
 def test_replay_returns_cached_response_and_charges_once(db_session):
@@ -562,6 +562,38 @@ def test_prune_retains_in_flight_by_default(db_session):
         db_session, older_than_seconds=86_400, include_in_flight=True
     )
     assert db_session.query(models.IdempotencyRecord).count() == 0
+
+
+def test_fingerprint_no_collision_with_null_bytes():
+    # length-prefixing must make the encoding injective: two materially different
+    # requests (query/body split differently around a null byte) can't collide
+    a = _fingerprint("POST", "/x", b"a\x00", b"")
+    b = _fingerprint("POST", "/x", b"a", b"\x00")
+    assert a != b
+
+
+def test_bodyless_status_stores_no_marker_body(db_session):
+    app = FastAPI()
+    gringotts.init_app(app, GringottsConfig())
+
+    @app.get("/nc")
+    def nc(user: CreditedUser = Depends(charge(1))):
+        return Response(status_code=204, headers={"Cache-Control": "no-store"})
+
+    _, key = auth.create_user_with_key(db_session, "nc", credits=10)
+    client = TestClient(app)
+    h = {"X-API-Key": key, "Idempotency-Key": "nck"}
+    r1 = client.get("/nc", headers=h)
+    assert r1.status_code == 204
+    rec = (
+        db_session.query(models.IdempotencyRecord)
+        .filter_by(idempotency_key="nck")
+        .one()
+    )
+    assert rec.response_body == b""  # a 204 must have no body, marker or otherwise
+    r2 = client.get("/nc", headers=h)
+    assert r2.status_code == 204
+    assert r2.content == b""  # replay stays bodyless
 
 
 def test_prune_idempotency_records(db_session):

@@ -41,6 +41,21 @@ Design choices (documented, not incidental):
 - **Client disconnects are not cached** and never release a committed charge: a
   ``CancelledError`` raised as the response streams is left to propagate, so the
   record stays and the retry gets ``409`` rather than risking a re-charge.
+
+Limitations (deliberate trade-offs for a money library):
+
+- **Only the charge is guaranteed exactly-once.** A handler that raises *before*
+  responding has its charge refunded by ``Depends(charge())``, so the key is
+  released and a genuine retry re-attempts — that is what makes transient failures
+  safe to retry. Any *other* side effect the handler commits before raising is not
+  rolled back by gringotts and could run again on that retry; such side effects
+  must be made idempotent by the application (e.g. its own key or a unique
+  constraint).
+- **A crashed or disconnected in-flight request leaks its lock.** The record stays
+  ``completed=False`` (a ``409`` for retries, never re-run — its outcome is
+  unknown), and ``prune-idempotency`` retains in-flight rows by default so it can't
+  free a still-running request's key. Clear abandoned locks during a maintenance
+  window with ``prune-idempotency --include-in-flight``.
 """
 
 import hashlib
@@ -73,11 +88,17 @@ _MARKER_BODY = json.dumps(
 
 
 def _fingerprint(method: str, path: str, query: bytes, body: bytes) -> str:
-    """SHA-256 over the parts of a request that define its identity."""
+    """SHA-256 over the parts of a request that define its identity.
+
+    Each part is length-prefixed so the encoding is injective — a separator byte
+    alone is not enough, because a part may itself contain that byte, letting a
+    crafted (query, body) collide with a different (query, body) and be wrongly
+    deduplicated.
+    """
     digest = hashlib.sha256()
     for part in (method.encode(), path.encode(), query, body):
+        digest.update(len(part).to_bytes(8, "big"))
         digest.update(part)
-        digest.update(b"\x00")
     return digest.hexdigest()
 
 
@@ -404,18 +425,30 @@ class IdempotencyMiddleware:
                 # Never persist a no-store body (it may hold a secret) or its
                 # side-effect headers (e.g. Set-Cookie); keep only the status.
                 kept = []
-            self._store(
-                record_id,
-                captured["status"],
-                _MARKER_BODY,
-                _dump_headers(
-                    kept,
-                    extra=[
-                        ("content-type", "application/json"),
-                        ("idempotent-response-not-cached", "true"),
-                    ],
-                ),
-            )
+            # A 204/304/1xx status forbids a body — replaying a marker body with a
+            # positive Content-Length there is malformed and servers may reject it.
+            if _is_bodyless(captured["status"]):
+                self._store(
+                    record_id,
+                    captured["status"],
+                    b"",
+                    _dump_headers(
+                        kept, extra=[("idempotent-response-not-cached", "true")]
+                    ),
+                )
+            else:
+                self._store(
+                    record_id,
+                    captured["status"],
+                    _MARKER_BODY,
+                    _dump_headers(
+                        kept,
+                        extra=[
+                            ("content-type", "application/json"),
+                            ("idempotent-response-not-cached", "true"),
+                        ],
+                    ),
+                )
         else:
             self._store(
                 record_id,
@@ -487,6 +520,11 @@ def _dump_headers(headers, extra=None) -> str:
     if extra:
         pairs.extend([list(pair) for pair in extra])
     return json.dumps(pairs)
+
+
+def _is_bodyless(status: int) -> bool:
+    """Whether an HTTP status forbids a response body (204, 304, 1xx)."""
+    return status in (204, 304) or 100 <= status < 200
 
 
 def _has_no_store(headers) -> bool:

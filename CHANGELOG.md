@@ -38,10 +38,14 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     `idempotency_header`, `idempotency_max_key_length`, `idempotency_max_body_bytes`,
     `idempotency_max_response_bytes`, `idempotency_retention_seconds`.
   - Backed by a new `idempotency_records` table (applied by `gringotts migrate`).
-  - Known limitation: a replay returns the stored response without re-checking
-    authorization, so a credential revoked mid-window can still replay its own prior
-    responses until they expire. Lower `idempotency_retention_seconds` to shrink the
-    window.
+  - Known limitations (deliberate): a replay returns the stored response without
+    re-checking authorization (a credential revoked mid-window can replay its own
+    prior responses until they expire — lower `idempotency_retention_seconds` to
+    shrink the window); only the **charge** is guaranteed exactly-once, so any
+    *other* non-idempotent side effect a handler commits before raising is the
+    application's responsibility; and a crashed/disconnected in-flight request
+    leaks its lock (a `409` for retries, cleared by `prune-idempotency
+    --include-in-flight`).
 - Curated documentation site: a grouped API reference, documented config fields,
   usage examples, and new guides (Quickstart, How it works, Stripe & webhooks,
   Examples).
