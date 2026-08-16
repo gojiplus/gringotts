@@ -1,11 +1,73 @@
 """Refund/dispute clawback: proportional, clamp-at-zero, idempotent, reversible."""
 
 import json
+import os
+from concurrent.futures import ThreadPoolExecutor
 
 from fastapi.testclient import TestClient
+from sqlalchemy.orm import sessionmaker
 from test_router import WEBHOOK_SECRET, make_app, sign
 
 from gringotts import auth, crud, models
+from gringotts.db import Base, make_engine
+
+
+def test_concurrent_partial_refunds_do_not_over_claw(tmp_path):
+    # 7 credits for 10 cents; four concurrent 1-cent refunds. Correct cumulative
+    # claw for 4 cents is round(7*4/10)=3; naive per-event rounding would claw
+    # 1 each = 4. The per-user write lock must serialize the cumulative math on
+    # both backends (FOR UPDATE is a no-op on SQLite).
+    url = os.getenv("GRINGOTTS_TEST_DATABASE_URL") or f"sqlite:///{tmp_path}/claw.db"
+    engine = make_engine(url)
+    SL = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    Base.metadata.drop_all(bind=engine)
+    Base.metadata.create_all(bind=engine)
+    with SL() as s:
+        user, _ = auth.create_user_with_key(s, "race", credits=0)
+        uid = user.id
+        s.add(
+            models.CreditTransaction(
+                user_id=uid,
+                amount=7,
+                kind="purchase",
+                balance_after=7,
+                amount_cents=10,
+                payment_intent_id="pi_race",
+            )
+        )
+        s.execute(
+            models.User.__table__.update()
+            .where(models.User.id == uid)
+            .values(credits=7)
+        )
+        s.commit()
+
+    def reverse(i):
+        # mirrors router._apply_reversal's locked cumulative math
+        s = SL()
+        try:
+            u = crud.lock_user(s, uid)
+            prior_cents, prior_clawed = crud.clawback_totals(s, "pi_race")
+            capped = min(prior_cents + 1, 10)
+            delta = max(0, round(7 * capped / 10) - prior_clawed)
+            crud.clawback_credits(
+                s,
+                u,
+                delta,
+                external_id=f"re_{i}",
+                amount_cents=1,
+                payment_intent_id="pi_race",
+            )
+        finally:
+            s.close()
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        list(pool.map(reverse, range(4)))
+
+    with SL() as c:
+        assert crud.get_user(c, uid).credits == 4  # 7 - 3 clawed, not over-clawed
+        assert crud.find_balance_discrepancies(c) == []
+    engine.dispose()
 
 
 def _client():

@@ -158,7 +158,9 @@ def _process_dispute(db, event, *, reinstate: bool) -> None:
         )
         raise HTTPException(status_code=503, detail="Withdrawal not seen; retry later")
     purchase = crud.find_purchase_by_payment_intent(db, payment_intent)
-    user = crud.get_user(db, purchase.user_id) if purchase else None
+    # Lock the user before reading/writing, same as _apply_reversal, so a
+    # concurrent refund and this reinstatement serialize on the cumulative math.
+    user = crud.lock_user(db, purchase.user_id) if purchase else None
     if user is None:
         logger.error("gringotts webhook %s: reinstate user missing", event["id"])
         return

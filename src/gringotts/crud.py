@@ -203,18 +203,22 @@ def find_purchase_by_payment_intent(
 
 
 def lock_user(db: Session, user_id: int) -> models.User | None:
-    """Return the user with a row lock held to commit (serializes clawback math).
+    """Take a write lock on the user row that serializes reversal math per user.
 
-    On Postgres this blocks a concurrent reversal for the same user until this
-    transaction commits, so cumulative totals are read and written atomically;
-    SQLite serializes writers anyway.
+    `SELECT ... FOR UPDATE` is a no-op on SQLite, so instead we issue a real
+    no-op `UPDATE` of the row: that acquires the row lock on Postgres and the
+    database write lock on SQLite, both held until commit. So two concurrent
+    reversals for the same purchase can't both read stale cumulative totals.
+    Returns None if the user does not exist.
     """
-    return (
+    updated = (
         db.query(models.User)
         .filter(models.User.id == user_id)
-        .with_for_update()
-        .one_or_none()
+        .update({models.User.credits: models.User.credits})
     )
+    if not updated:
+        return None
+    return db.get(models.User, user_id)
 
 
 def clawback_deducted(db: Session, external_id: str) -> int:
