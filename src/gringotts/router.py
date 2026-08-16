@@ -10,7 +10,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from sqlalchemy.orm import Session
 
 from . import billing, crud, pages
-from .config import GringottsConfig
+from .config import GringottsConfig, format_money
 from .db import get_session
 from .dependencies import API_KEY_HEADER, authenticate
 
@@ -24,6 +24,147 @@ _FULFILL_EVENTS = {
     "checkout.session.async_payment_succeeded",
 }
 _PAID_STATUSES = {"paid", "no_payment_required"}
+
+# Reversal events. A refund (possibly partial) claws back a proportional share
+# of the granted credits; a dispute claws back on funds_withdrawn and re-credits
+# on funds_reinstated. The "warning_*" dispute events move no funds, so ignore.
+_REFUND_EVENTS = {"refund.created", "refund.updated"}
+_DISPUTE_WITHDRAWN = "charge.dispute.funds_withdrawn"
+_DISPUTE_REINSTATED = "charge.dispute.funds_reinstated"
+
+
+def _apply_reversal(
+    db, event, *, payment_intent, reversed_cents, external_id, endpoint
+):
+    """Claw back credits for a refund/dispute using cumulative delta math.
+
+    The target total clawback is `round(granted * cumulative_reversed / paid)`,
+    capped at the full payment; we deduct only the delta over what earlier events
+    already clawed, so independent per-event rounding can never over- or
+    under-claw. Idempotent on `external_id`. Raises 503 (retryable) when the
+    purchase isn't found yet — Stripe does not guarantee delivery order, so the
+    reversal may simply arrive before its checkout event.
+    """
+    if crud.external_id_exists(db, external_id):
+        return  # already processed this reversal
+    purchase = crud.find_purchase_by_payment_intent(db, payment_intent)
+    if purchase is None:
+        logger.warning(
+            "gringotts webhook %s: reversal for payment_intent=%s with no matching "
+            "purchase (out-of-order delivery, or a pre-0.3 purchase); asking Stripe "
+            "to retry",
+            event["id"],
+            payment_intent,
+        )
+        raise HTTPException(status_code=503, detail="Purchase not found; retry later")
+    if not purchase.amount_cents:
+        logger.error(
+            "gringotts webhook %s: purchase for payment_intent=%s has no amount; "
+            "cannot compute a proportional clawback",
+            event["id"],
+            payment_intent,
+        )
+        return
+    user = crud.get_user(db, purchase.user_id)
+    if user is None:
+        logger.error("gringotts webhook %s: reversal user missing", event["id"])
+        raise HTTPException(status_code=503, detail="User not found; retry later")
+    granted, paid = purchase.amount, purchase.amount_cents
+    prior_cents, prior_clawed = crud.clawback_totals(db, payment_intent)
+    capped_cents = min(prior_cents + reversed_cents, paid)
+    target = round(granted * capped_cents / paid)
+    delta = max(0, target - prior_clawed)
+    crud.clawback_credits(
+        db,
+        user,
+        delta,
+        external_id=external_id,
+        endpoint=endpoint,
+        amount_cents=reversed_cents,
+        payment_intent_id=payment_intent,
+    )
+
+
+def _process_refund(db, event) -> None:
+    """Claw back credits for a settled Stripe refund (clamped at zero)."""
+    refund = event["data"]["object"]
+    try:
+        payment_intent = refund["payment_intent"]
+        refund_id = refund["id"]
+        refund_amount = int(refund["amount"])
+    except (KeyError, TypeError, ValueError):
+        logger.error("gringotts webhook %s: refund missing fields", event["id"])
+        return
+    try:
+        status = refund["status"]
+    except (KeyError, TypeError):
+        status = "succeeded"  # older API versions omit it; treat as settled
+    if status != "succeeded":
+        # A pending/failed/canceled refund hasn't returned money — wait for the
+        # refund.updated that flips it to succeeded (no row written yet, so that
+        # later event isn't deduped away).
+        logger.info(
+            "gringotts webhook %s: refund %s status=%s, not clawing yet",
+            event["id"],
+            refund_id,
+            status,
+        )
+        return
+    _apply_reversal(
+        db,
+        event,
+        payment_intent=payment_intent,
+        reversed_cents=refund_amount,
+        external_id=refund_id,
+        endpoint="stripe:refund",
+    )
+
+
+def _process_dispute(db, event, *, reinstate: bool) -> None:
+    """Claw back on a withdrawn dispute, re-credit on a reinstated one."""
+    dispute = event["data"]["object"]
+    try:
+        payment_intent = dispute["payment_intent"]
+        dispute_id = dispute["id"]
+        dispute_amount = int(dispute["amount"])
+    except (KeyError, TypeError, ValueError):
+        logger.error("gringotts webhook %s: dispute missing fields", event["id"])
+        return
+    withdrawn_key = f"{dispute_id}:withdrawn"
+    if not reinstate:
+        _apply_reversal(
+            db,
+            event,
+            payment_intent=payment_intent,
+            reversed_cents=dispute_amount,
+            external_id=withdrawn_key,
+            endpoint="stripe:dispute",
+        )
+        return
+    # Reinstatement: restore exactly what the withdrawal clawed back.
+    if crud.external_id_exists(db, f"{dispute_id}:reinstated"):
+        return  # already reinstated
+    if not crud.external_id_exists(db, withdrawn_key):
+        # Out-of-order: the withdrawal hasn't been processed yet. Retry so we
+        # don't lose the reinstatement and later deduct permanently.
+        logger.warning(
+            "gringotts webhook %s: dispute %s reinstated before withdrawal seen; "
+            "asking Stripe to retry",
+            event["id"],
+            dispute_id,
+        )
+        raise HTTPException(status_code=503, detail="Withdrawal not seen; retry later")
+    restored = crud.clawback_deducted(db, withdrawn_key)
+    if restored:
+        purchase = crud.find_purchase_by_payment_intent(db, payment_intent)
+        user = crud.get_user(db, purchase.user_id) if purchase else None
+        if user is None:
+            logger.error("gringotts webhook %s: reinstate user missing", event["id"])
+            return
+        crud.grant_credits(
+            db, user, restored, kind="reinstate", external_id=f"{dispute_id}:reinstated"
+        )
+
 
 _BUY_PAGE = """<!doctype html>
 <html>
@@ -145,7 +286,7 @@ def build_router(config: GringottsConfig) -> APIRouter:
             f'<label><input type="radio" name="pack" value="{i}"'
             f" {'checked' if i == 0 else ''}>"
             f" {html.escape(pack.name)} — {pack.credits} credits for "
-            f"{pack.price_cents / 100:.2f} {pack.currency.upper()}</label>"
+            f"{format_money(pack.price_cents, pack.currency)}</label>"
             for i, pack in enumerate(config.packs)
         )
         status_html = ""
@@ -239,6 +380,10 @@ def build_router(config: GringottsConfig) -> APIRouter:
                 amount_cents = int(session["amount_total"])
             except (KeyError, TypeError, ValueError):
                 amount_cents = None
+            try:
+                payment_intent_id = session["payment_intent"]
+            except (KeyError, TypeError):
+                payment_intent_id = None
             user = crud.get_user(db, user_id)
             if user is None:
                 # Usually transient (the user existed when checkout was created;
@@ -272,12 +417,19 @@ def build_router(config: GringottsConfig) -> APIRouter:
                 kind="purchase",
                 external_id=session_id,
                 amount_cents=amount_cents,
+                payment_intent_id=payment_intent_id,
             )
             if not granted:
                 logger.info(
                     "gringotts webhook: checkout session %s already credited",
                     session_id,
                 )
+        elif event["type"] in _REFUND_EVENTS:
+            _process_refund(db, event)
+        elif event["type"] == _DISPUTE_WITHDRAWN:
+            _process_dispute(db, event, reinstate=False)
+        elif event["type"] == _DISPUTE_REINSTATED:
+            _process_dispute(db, event, reinstate=True)
         return {"received": True}
 
     return router

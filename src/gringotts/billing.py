@@ -31,4 +31,7 @@ def create_checkout_session(
         success_url=config.success_url or f"{buy_url}?status=success",
         cancel_url=config.cancel_url or f"{buy_url}?status=cancelled",
         metadata={"gringotts_user_id": str(user.id), "credits": str(pack.credits)},
+        # copied onto the PaymentIntent and its Charge, so refund/dispute events
+        # carry the user id even without the checkout session
+        payment_intent_data={"metadata": {"gringotts_user_id": str(user.id)}},
     )

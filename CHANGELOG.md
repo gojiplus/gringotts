@@ -4,6 +4,43 @@ All notable changes to this project are documented in this file. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-08-15
+
+Correct money accounting: refunds and disputes now reverse the credits they
+granted, currency display is fixed for zero-decimal currencies, and consumption
+stats net out refunds.
+
+### Added
+
+- **Refund and dispute clawback.** The webhook now handles `refund.created` /
+  `refund.updated` (claws back a proportional share of the granted credits —
+  `round(credits * refund_amount / amount_paid)`) and
+  `charge.dispute.funds_withdrawn` (claws back the purchase), and re-credits on
+  `charge.dispute.funds_reinstated`. Clawback is **clamped at zero** (never drives
+  a balance negative), idempotent on the Stripe `Refund`/`Dispute` id, and logs a
+  warning when it can't fully recover. Register the new events on your Stripe
+  webhook.
+- **PaymentIntent correlation.** Purchase rows store `payment_intent_id`, and
+  Checkout sets `payment_intent_data.metadata`, so refund/dispute events (which
+  carry the PaymentIntent, not the checkout session) map back to the purchase
+  with no extra API call.
+- **Zero-decimal currency support.** `config.is_zero_decimal` /
+  `config.format_money`; the buy page and admin revenue tile now show whole units
+  for JPY/KRW/etc. instead of dividing by 100. `price_cents` is documented as the
+  amount in the currency's smallest unit.
+
+### Changed
+
+- Admin `credits_consumed` (dashboard and JSON) is now **net of refunds** — a
+  fully refunded request counts as zero consumption.
+
+### Upgrading
+
+- Run `gringotts migrate` to add `payment_intent_id` to an existing database.
+- Clawback correlates only purchases made on 0.3.0+ (older purchase rows have no
+  stored PaymentIntent); a refund/dispute on a pre-0.3 purchase is logged and
+  acknowledged, not auto-clawed.
+
 ## [0.2.0] - 2026-08-15
 
 A money-correctness pass (an independent multi-model audit) plus a

@@ -1,10 +1,14 @@
 """Database operations: users, atomic credit movements, and ledger queries."""
 
+import logging
+
 from sqlalchemy import case, func
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from . import auth, models
+
+logger = logging.getLogger(__name__)
 
 
 def create_user(
@@ -128,6 +132,7 @@ def grant_credits(
     kind: str = "grant",
     external_id: str | None = None,
     amount_cents: int | None = None,
+    payment_intent_id: str | None = None,
 ) -> bool:
     """Atomically add credits with a ledger row.
 
@@ -148,6 +153,7 @@ def grant_credits(
             kind=kind,
             external_id=external_id,
             amount_cents=amount_cents,
+            payment_intent_id=payment_intent_id,
             balance_after=user.credits,
         )
     )
@@ -175,6 +181,119 @@ def external_id_exists(db: Session, external_id: str) -> bool:
     )
 
 
+def find_purchase_by_payment_intent(
+    db: Session, payment_intent_id: str
+) -> models.CreditTransaction | None:
+    """Return the earliest purchase row for a Stripe PaymentIntent, or None."""
+    return (
+        db.query(models.CreditTransaction)
+        .filter(
+            models.CreditTransaction.kind == "purchase",
+            models.CreditTransaction.payment_intent_id == payment_intent_id,
+        )
+        .order_by(models.CreditTransaction.id)
+        .first()
+    )
+
+
+def clawback_deducted(db: Session, external_id: str) -> int:
+    """The credits a prior clawback row actually deducted (absolute value)."""
+    row = (
+        db.query(models.CreditTransaction.amount)
+        .filter(models.CreditTransaction.external_id == external_id)
+        .first()
+    )
+    return -int(row[0]) if row is not None else 0
+
+
+def clawback_totals(db: Session, payment_intent_id: str) -> tuple[int, int]:
+    """Cumulative (reversed cents, credits clawed) for a purchase's clawbacks.
+
+    Lets refund/dispute handling compute the target total clawback and deduct
+    only the delta, so independent per-event rounding can't over- or under-claw.
+    """
+    row = (
+        db.query(
+            func.coalesce(func.sum(models.CreditTransaction.amount_cents), 0),
+            func.coalesce(func.sum(-models.CreditTransaction.amount), 0),
+        )
+        .filter(
+            models.CreditTransaction.kind == "clawback",
+            models.CreditTransaction.payment_intent_id == payment_intent_id,
+        )
+        .one()
+    )
+    return int(row[0]), int(row[1])
+
+
+def clawback_credits(
+    db: Session,
+    user: models.User,
+    amount: int,
+    *,
+    external_id: str,
+    kind: str = "clawback",
+    endpoint: str | None = None,
+    amount_cents: int | None = None,
+    payment_intent_id: str | None = None,
+) -> int:
+    """Deduct up to `amount` credits (clamped at zero) with a ledger row.
+
+    Used to reverse a refunded or disputed purchase. Never drives the balance
+    negative — it deducts only what the user still holds. Returns the amount
+    actually deducted. Idempotent on `external_id`: a redelivered event finds the
+    existing row and deducts nothing. A negative `amount` raises ValueError.
+    `amount_cents` records the reversed money and `payment_intent_id` ties the row
+    to its purchase, so cumulative clawback math stays exact across partials.
+    """
+    if amount < 0:
+        raise ValueError("clawback amount cannot be negative")
+    # Lock the user row so the clamp reads a stable balance (Postgres); SQLite
+    # serializes writers, so the read-decide-write is atomic there too.
+    current = (
+        db.query(models.User.credits)
+        .filter(models.User.id == user.id)
+        .with_for_update()
+        .scalar()
+    )
+    deducted = min(amount, current) if current is not None else 0
+    if deducted:
+        db.query(models.User).filter(models.User.id == user.id).update(
+            {models.User.credits: models.User.credits - deducted}
+        )
+    db.refresh(user)
+    db.add(
+        models.CreditTransaction(
+            user_id=user.id,
+            amount=-deducted,
+            kind=kind,
+            external_id=external_id,
+            endpoint=endpoint,
+            amount_cents=amount_cents,
+            payment_intent_id=payment_intent_id,
+            balance_after=user.credits,
+        )
+    )
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        if external_id_exists(db, external_id):
+            return 0  # already processed (idempotent replay)
+        raise
+    db.refresh(user)
+    if deducted < amount:
+        logger.warning(
+            "gringotts clawback clamped: wanted %s, deducted %s for user %s "
+            "(external_id=%s)",
+            amount,
+            deducted,
+            user.id,
+            external_id,
+        )
+    return deducted
+
+
 def list_transactions(
     db: Session,
     user_id: int | None = None,
@@ -194,11 +313,19 @@ def list_transactions(
 
 
 def list_users_with_stats(db: Session) -> list[dict]:
-    """Return, per user, balance plus consumption and last activity from the ledger."""
+    """Return, per user, balance plus consumption and last activity from the ledger.
+
+    `consumed` is net of refunds: a charge adds to it, a refund (which reverses a
+    charge) subtracts, so a fully refunded request counts as zero consumption.
+    """
     consumed = func.sum(
         case(
             (
                 models.CreditTransaction.kind == "charge",
+                -models.CreditTransaction.amount,
+            ),
+            (
+                models.CreditTransaction.kind == "refund",
                 -models.CreditTransaction.amount,
             ),
             else_=0,
@@ -244,11 +371,22 @@ def aggregate_stats(db: Session) -> dict:
         )
         return int(value or 0)
 
+    charged = -_sum_for("charge", models.CreditTransaction.amount)
+    refunded = _sum_for("refund", models.CreditTransaction.amount)
+    # clawback rows are negative, reinstate positive; adding both nets a
+    # refunded/disputed purchase back out so the metric can't overstate.
+    purchased = (
+        _sum_for("purchase", models.CreditTransaction.amount)
+        + _sum_for("clawback", models.CreditTransaction.amount)
+        + _sum_for("reinstate", models.CreditTransaction.amount)
+    )
     return {
         "users": int(user_count),
         "credits_outstanding": int(outstanding),
-        "credits_consumed": -_sum_for("charge", models.CreditTransaction.amount),
-        "credits_purchased": _sum_for("purchase", models.CreditTransaction.amount),
+        # net of refunds: a fully refunded charge is zero consumption
+        "credits_consumed": charged - refunded,
+        # net of clawbacks: a refunded/disputed purchase nets back out
+        "credits_purchased": purchased,
         "revenue_cents": _sum_for("purchase", models.CreditTransaction.amount_cents),
     }
 

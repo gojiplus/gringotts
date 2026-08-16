@@ -2,7 +2,7 @@
 idempotently, and refuses to run on top of ledger drift."""
 
 import pytest
-from sqlalchemy import text
+from sqlalchemy import inspect, text
 from sqlalchemy.orm import sessionmaker
 
 from gringotts import crud, migrations
@@ -67,6 +67,18 @@ def test_migrate_backfills_balance_after(tmp_path):
                 text("SELECT version FROM gringotts_schema_version")
             ).scalar()
         assert version == migrations.HEAD
+    finally:
+        engine.dispose()
+
+
+def test_migrate_adds_payment_intent_id(tmp_path):
+    engine = _legacy_db(tmp_path)
+    try:
+        migrations.run_pending(engine)
+        with engine.connect() as conn:
+            cols = {c["name"] for c in inspect(conn).get_columns("credit_transactions")}
+        assert "payment_intent_id" in cols
+        assert "balance_after" in cols
     finally:
         engine.dispose()
 
