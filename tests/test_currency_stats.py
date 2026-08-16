@@ -1,7 +1,19 @@
 """Zero-decimal currency formatting and refund-net consumption stats."""
 
+import pytest
+
 from gringotts import auth, crud
-from gringotts.config import format_money, is_zero_decimal
+from gringotts.config import CreditPack, GringottsConfig, format_money, is_zero_decimal
+
+
+def test_mixed_currency_packs_rejected():
+    with pytest.raises(ValueError, match="one currency"):
+        GringottsConfig(
+            packs=[
+                CreditPack(credits=100, price_cents=500, name="usd", currency="usd"),
+                CreditPack(credits=100, price_cents=500, name="eur", currency="eur"),
+            ]
+        )
 
 
 def test_zero_decimal_currency_formatting():

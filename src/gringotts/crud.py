@@ -182,9 +182,15 @@ def external_id_exists(db: Session, external_id: str) -> bool:
 
 
 def find_purchase_by_payment_intent(
-    db: Session, payment_intent_id: str
+    db: Session, payment_intent_id: str | None
 ) -> models.CreditTransaction | None:
-    """Return the earliest purchase row for a Stripe PaymentIntent, or None."""
+    """Return the earliest purchase row for a Stripe PaymentIntent, or None.
+
+    A falsy `payment_intent_id` matches nothing — never a NULL-keyed pre-0.3
+    purchase — so a reversal with no PaymentIntent can't hit an unrelated user.
+    """
+    if not payment_intent_id:
+        return None
     return (
         db.query(models.CreditTransaction)
         .filter(
@@ -194,6 +200,25 @@ def find_purchase_by_payment_intent(
         .order_by(models.CreditTransaction.id)
         .first()
     )
+
+
+def lock_user(db: Session, user_id: int) -> models.User | None:
+    """Take a write lock on the user row that serializes reversal math per user.
+
+    `SELECT ... FOR UPDATE` is a no-op on SQLite, so instead we issue a real
+    no-op `UPDATE` of the row: that acquires the row lock on Postgres and the
+    database write lock on SQLite, both held until commit. So two concurrent
+    reversals for the same purchase can't both read stale cumulative totals.
+    Returns None if the user does not exist.
+    """
+    updated = (
+        db.query(models.User)
+        .filter(models.User.id == user_id)
+        .update({models.User.credits: models.User.credits})
+    )
+    if not updated:
+        return None
+    return db.get(models.User, user_id)
 
 
 def clawback_deducted(db: Session, external_id: str) -> int:
@@ -212,13 +237,16 @@ def clawback_totals(db: Session, payment_intent_id: str) -> tuple[int, int]:
     Lets refund/dispute handling compute the target total clawback and deduct
     only the delta, so independent per-event rounding can't over- or under-claw.
     """
+    # Include reinstatements: a won dispute writes a reinstate row carrying the
+    # negative of the withdrawn cents, so its contribution cancels here and a
+    # later refund on the same purchase is measured against the true net.
     row = (
         db.query(
             func.coalesce(func.sum(models.CreditTransaction.amount_cents), 0),
             func.coalesce(func.sum(-models.CreditTransaction.amount), 0),
         )
         .filter(
-            models.CreditTransaction.kind == "clawback",
+            models.CreditTransaction.kind.in_(("clawback", "reinstate")),
             models.CreditTransaction.payment_intent_id == payment_intent_id,
         )
         .one()
@@ -380,6 +408,15 @@ def aggregate_stats(db: Session) -> dict:
         + _sum_for("clawback", models.CreditTransaction.amount)
         + _sum_for("reinstate", models.CreditTransaction.amount)
     )
+    # revenue = money paid minus money reversed. clawback rows carry the reversed
+    # cents (positive), reinstate rows the negative offset, so subtracting both
+    # nets a refunded/disputed payment out of revenue.
+    reversed_cents = _sum_for(
+        "clawback", models.CreditTransaction.amount_cents
+    ) + _sum_for("reinstate", models.CreditTransaction.amount_cents)
+    revenue_cents = (
+        _sum_for("purchase", models.CreditTransaction.amount_cents) - reversed_cents
+    )
     return {
         "users": int(user_count),
         "credits_outstanding": int(outstanding),
@@ -387,7 +424,7 @@ def aggregate_stats(db: Session) -> dict:
         "credits_consumed": charged - refunded,
         # net of clawbacks: a refunded/disputed purchase nets back out
         "credits_purchased": purchased,
-        "revenue_cents": _sum_for("purchase", models.CreditTransaction.amount_cents),
+        "revenue_cents": revenue_cents,
     }
 
 
