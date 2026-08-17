@@ -20,6 +20,7 @@ from test_charge import make_app
 import gringotts
 from gringotts import CreditedUser, GringottsConfig, auth, charge, crud, models
 from gringotts import db as gdb
+from gringotts import idempotency as idempotency_module
 from gringotts.db import Base, make_engine
 from gringotts.idempotency import IdempotencyMiddleware, _fingerprint
 
@@ -381,6 +382,41 @@ def test_expired_record_reruns(db_session):
     client.get("/e", headers=h)  # prior record already expired -> re-runs
     db_session.refresh(user)
     assert user.credits == 6  # both charged; the cached row expired
+
+
+def test_retention_starts_when_response_is_stored(db_session, monkeypatch):
+    started_at = datetime.now(UTC)
+
+    class Clock(datetime):
+        current = started_at
+
+        @classmethod
+        def now(cls, tz=None):
+            if tz is None:
+                return cls.current.replace(tzinfo=None)
+            return cls.current.astimezone(tz)
+
+    monkeypatch.setattr(idempotency_module, "datetime", Clock)
+    app = FastAPI()
+    gringotts.init_app(app, GringottsConfig(idempotency_retention_seconds=86_400))
+
+    @app.post("/slow")
+    def slow(user: CreditedUser = Depends(charge(2))):
+        Clock.current = started_at + timedelta(days=2)
+        return {"ok": True}
+
+    user, key = auth.create_user_with_key(db_session, "slow", credits=10)
+    client = TestClient(app)
+    headers = {"X-API-Key": key, "Idempotency-Key": "slow-key"}
+
+    first = client.post("/slow", headers=headers)
+    replay = client.post("/slow", headers=headers)
+
+    assert first.status_code == 200
+    assert replay.status_code == 200
+    assert replay.headers.get("idempotent-replayed") == "true"
+    db_session.refresh(user)
+    assert user.credits == 8
 
 
 def test_pruned_expired_record_is_claimed_without_spurious_conflict(

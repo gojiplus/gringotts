@@ -527,6 +527,11 @@ class IdempotencyMiddleware:
             ).update(
                 {
                     IdempotencyRecord.completed: True,
+                    # Completed rows age from durable response storage, not from
+                    # the initial claim. Otherwise a request that runs longer
+                    # than the retention window can be executed again on an
+                    # immediate retry.
+                    IdempotencyRecord.created_at: datetime.now(UTC),
                     IdempotencyRecord.status_code: status,
                     IdempotencyRecord.response_body: body,
                     IdempotencyRecord.response_headers: headers_json,
