@@ -42,7 +42,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     (e.g. a daily cron).
   - Configurable via `GringottsConfig`: `idempotency_enabled` (default on),
     `idempotency_header`, `idempotency_max_key_length`, `idempotency_max_body_bytes`,
-    `idempotency_max_response_bytes`, `idempotency_retention_seconds`.
+    `idempotency_max_response_bytes`, `idempotency_retention_seconds`, and
+    `idempotency_replay_validator`.
   - Backed by a new `idempotency_records` table (applied by `gringotts migrate`).
   - API-key validity and built-in admin authorization are checked before replay;
     revoking either blocks the cached response. Known limitations (deliberate):
@@ -51,6 +52,11 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     application's responsibility; and a crashed/disconnected in-flight request
     leaks its lock (a `409` for retries, cleared by `prune-idempotency
     --include-in-flight`).
+  - Built-in routes revalidate their complete authorization state before replay.
+    Host routes require an `idempotency_replay_validator` to revalidate mutable
+    application authorization; without one, the operation stays locked against
+    duplicate execution and the retry returns `409` rather than exposing cached
+    response data.
 - Curated documentation site: a grouped API reference, documented config fields,
   usage examples, and new guides (Quickstart, How it works, Stripe & webhooks,
   Examples).

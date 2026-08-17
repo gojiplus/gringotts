@@ -16,8 +16,9 @@ refund — the handler simply does not execute a second time.
 Design choices (documented, not incidental):
 
 - **Only authenticated callers create records.** The API key is validated before
-  any row is inserted, so an unauthenticated client can't fill the table; its
-  request passes through to the app's own ``401`` (which is not cached).
+  any row is inserted, so an unauthenticated client can't fill the table. A keyed
+  request with an invalid or revoked credential receives ``401`` without running
+  the handler.
 - **Scope is the caller** (SHA-256 of the ``X-API-Key``, or the built-in Checkout
   form's API key), so one caller can never replay another caller's key.
 - **A fingerprint** (method + path + query + every request header + body) guards
@@ -59,6 +60,11 @@ Limitations (deliberate trade-offs for a money library):
   unknown), and ``prune-idempotency`` retains in-flight rows by default so it can't
   free a still-running request's key. Clear abandoned locks during a maintenance
   window with ``prune-idempotency --include-in-flight``.
+- **Host authorization needs an explicit replay validator.** Built-in routes bind
+  all of their mutable authorization into the caller context. A host route gets a
+  cached response only when ``idempotency_replay_validator`` approves the current
+  ASGI scope; without one, its retry returns ``409`` while remaining protected
+  against duplicate execution.
 """
 
 import hashlib
@@ -81,6 +87,11 @@ _IN_PROGRESS_BODY = json.dumps(
 ).encode()
 _KEY_TOO_LONG_BODY = json.dumps({"detail": "Idempotency-Key is too long"}).encode()
 _EMPTY_KEY_BODY = json.dumps({"detail": "Idempotency-Key cannot be empty"}).encode()
+_INVALID_CALLER_BODY = json.dumps({"detail": "Invalid API key"}).encode()
+_REPLAY_VALIDATOR_BODY = json.dumps(
+    {"detail": "Host authorization must be revalidated before replay"}
+).encode()
+_REPLAY_DENIED_BODY = json.dumps({"detail": "Replay authorization denied"}).encode()
 _BODY_TOO_LARGE_BODY = json.dumps(
     {"detail": "Request body too large for an idempotent request"}
 ).encode()
@@ -112,10 +123,17 @@ def _fingerprint(
     """
     digest = hashlib.sha256()
     parts = [method.encode(), path.encode(), query, body, caller_context]
-    request_headers = headers or []
-    parts.append(len(request_headers).to_bytes(8, "big"))
-    for name, value in request_headers:
-        parts.extend((name.lower(), value))
+    grouped_headers: dict[bytes, list[bytes]] = {}
+    for name, value in headers or []:
+        grouped_headers.setdefault(name.lower(), []).append(value)
+    canonical_headers = [
+        (name, value)
+        for name in sorted(grouped_headers)
+        for value in grouped_headers[name]
+    ]
+    parts.append(len(canonical_headers).to_bytes(8, "big"))
+    for name, value in canonical_headers:
+        parts.extend((name, value))
     for part in parts:
         digest.update(len(part).to_bytes(8, "big"))
         digest.update(part)
@@ -144,6 +162,8 @@ class IdempotencyMiddleware:
         max_response_bytes: int = 1_000_000,
         retention_seconds: float = 86_400.0,
         form_api_key_path: str | None = None,
+        builtin_route_validator=None,
+        replay_validator=None,
     ) -> None:
         """Wrap `app`, reading `header` and honoring the size and age limits."""
         self.app = app
@@ -154,6 +174,8 @@ class IdempotencyMiddleware:
         self.max_response_bytes = max_response_bytes
         self.retention_seconds = retention_seconds
         self.form_api_key_path = form_api_key_path
+        self.builtin_route_validator = builtin_route_validator
+        self.replay_validator = replay_validator
 
     async def __call__(self, scope, receive, send) -> None:
         """Intercept a keyed HTTP request; otherwise pass straight through."""
@@ -218,8 +240,10 @@ class IdempotencyMiddleware:
         # be able to create records, so it just falls through to the app's 401.
         caller_context = await run_in_threadpool(self._caller_context, api_key)
         if caller_context is None:
-            app_receive = _body_replayer(body, receive) if body is not None else receive
-            await self.app(scope, app_receive, send)
+            # A supplied Idempotency-Key is an explicit request for protection.
+            # Never downgrade it to an unkeyed handler run after credential
+            # revocation, which could repeat an already-completed side effect.
+            await self._send(send, 401, _INVALID_CALLER_BODY, _JSON)
             return
 
         key = raw_key.decode("latin-1")
@@ -267,6 +291,18 @@ class IdempotencyMiddleware:
             return
         if outcome == "replay":
             assert stored is not None  # noqa: S101 - guaranteed by the outcome
+            builtin_request = (
+                self.builtin_route_validator is not None
+                and await run_in_threadpool(self.builtin_route_validator, scope)
+            )
+            if not builtin_request:
+                if self.replay_validator is None:
+                    await self._send(send, 409, _REPLAY_VALIDATOR_BODY, _JSON)
+                    return
+                allowed = await run_in_threadpool(self.replay_validator, scope)
+                if not allowed:
+                    await self._send(send, 403, _REPLAY_DENIED_BODY, _JSON)
+                    return
             status, resp_body, resp_headers = stored
             await self._send_replay(send, status or 200, resp_body or b"", resp_headers)
             return

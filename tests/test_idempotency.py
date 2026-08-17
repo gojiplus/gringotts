@@ -25,6 +25,11 @@ from gringotts.db import Base, make_engine
 from gringotts.idempotency import IdempotencyMiddleware, _fingerprint
 
 
+def replay_config(**kwargs):
+    kwargs.setdefault("idempotency_replay_validator", lambda _scope: True)
+    return GringottsConfig(**kwargs)
+
+
 def _client_fingerprint(client, method, path, headers, *, is_admin=False):
     request = client.build_request(method, path, headers=headers)
     fingerprint_headers = [
@@ -123,7 +128,7 @@ def test_changed_pricing_header_conflicts(db_session):
 
 def test_changed_authorization_header_cannot_replay_cached_response(db_session):
     app = FastAPI()
-    gringotts.init_app(app, GringottsConfig())
+    gringotts.init_app(app, replay_config())
 
     @app.get("/private")
     def private(request: Request, user: CreditedUser = Depends(charge(1))):
@@ -140,6 +145,32 @@ def test_changed_authorization_header_cannot_replay_cached_response(db_session):
     assert second.status_code == 409
     db_session.refresh(user)
     assert user.credits == 9
+
+
+def test_reordered_distinct_headers_replay_same_operation(db_session):
+    user, key = auth.create_user_with_key(db_session, "header-order", credits=10)
+    client = TestClient(make_app())
+    first_headers = [
+        ("X-API-Key", key),
+        ("Idempotency-Key", "header-order-key"),
+        ("X-First", "1"),
+        ("X-Second", "2"),
+    ]
+    second_headers = [
+        ("X-API-Key", key),
+        ("Idempotency-Key", "header-order-key"),
+        ("X-Second", "2"),
+        ("X-First", "1"),
+    ]
+
+    first = client.get("/hello", headers=first_headers)
+    replay = client.get("/hello", headers=second_headers)
+
+    assert first.status_code == 200
+    assert replay.status_code == 200
+    assert replay.headers.get("idempotent-replayed") == "true"
+    db_session.refresh(user)
+    assert user.credits == 8
 
 
 def test_server_error_is_not_cached_and_retry_reattempts(db_session):
@@ -159,7 +190,7 @@ def test_retry_after_failure_charges_once(db_session):
     # first keyed attempt fails (500, refunded, not cached); the retry that
     # succeeds is charged fresh — not replayed into free successful work.
     app = FastAPI()
-    gringotts.init_app(app, GringottsConfig())
+    gringotts.init_app(app, replay_config())
     calls = {"n": 0}
 
     @app.get("/flaky")
@@ -222,7 +253,7 @@ def test_oversized_key_is_rejected(db_session):
 
 def test_idempotency_can_be_disabled(db_session):
     app = FastAPI()
-    gringotts.init_app(app, GringottsConfig(idempotency_enabled=False))
+    gringotts.init_app(app, replay_config(idempotency_enabled=False))
 
     @app.get("/hello")
     def hello(user: CreditedUser = Depends(charge(2))):
@@ -272,7 +303,7 @@ def test_concurrent_first_attempts_run_handler_once(tmp_path, monkeypatch):
         user_id = user.id
 
     app = FastAPI()
-    gringotts.init_app(app, GringottsConfig())
+    gringotts.init_app(app, replay_config())
     calls = 0
     calls_lock = threading.Lock()
 
@@ -365,7 +396,7 @@ def test_empty_key_is_rejected_before_charge(db_session):
 
 def test_replay_preserves_response_headers(db_session):
     app = FastAPI()
-    gringotts.init_app(app, GringottsConfig())
+    gringotts.init_app(app, replay_config())
 
     @app.get("/h")
     def h(response: Response, user: CreditedUser = Depends(charge(1))):
@@ -382,9 +413,108 @@ def test_replay_preserves_response_headers(db_session):
     assert r2.headers.get("idempotent-replayed") == "true"
 
 
+def test_host_replay_requires_current_authorization_validator(db_session):
+    _, key = auth.create_user_with_key(db_session, "host-auth", credits=0)
+    allowed = True
+    calls = 0
+
+    def authorize_replay(_scope):
+        return allowed
+
+    app = FastAPI()
+    gringotts.init_app(
+        app, GringottsConfig(idempotency_replay_validator=authorize_replay)
+    )
+
+    @app.post("/private")
+    def private():
+        nonlocal calls
+        calls += 1
+        return {"secret": "value"}
+
+    client = TestClient(app)
+    headers = {"X-API-Key": key, "Idempotency-Key": "private-key"}
+    assert client.post("/private", headers=headers).status_code == 200
+    allowed = False
+    denied = client.post("/private", headers=headers)
+
+    assert denied.status_code == 403
+    assert denied.headers.get("idempotent-replayed") is None
+    assert calls == 1
+
+
+def test_host_replay_without_validator_stays_locked(db_session):
+    _, key = auth.create_user_with_key(db_session, "host-locked", credits=0)
+    app = FastAPI()
+    gringotts.init_app(app, GringottsConfig())
+    calls = 0
+
+    @app.post("/side-effect")
+    def side_effect():
+        nonlocal calls
+        calls += 1
+        return {"calls": calls}
+
+    client = TestClient(app)
+    headers = {"X-API-Key": key, "Idempotency-Key": "side-effect-key"}
+    assert client.post("/side-effect", headers=headers).status_code == 200
+    replay = client.post("/side-effect", headers=headers)
+
+    assert replay.status_code == 409
+    assert calls == 1
+
+
+def test_host_route_under_gringotts_prefix_is_not_trusted(db_session):
+    _, key = auth.create_user_with_key(db_session, "host-prefix", credits=0)
+    app = FastAPI()
+    calls = 0
+
+    @app.post("/gringotts/host-side-effect")
+    def host_side_effect():
+        nonlocal calls
+        calls += 1
+        return {"calls": calls}
+
+    gringotts.init_app(app, GringottsConfig())
+    client = TestClient(app)
+    headers = {"X-API-Key": key, "Idempotency-Key": "host-prefix-key"}
+
+    assert (
+        client.post("/gringotts/host-side-effect", headers=headers).status_code == 200
+    )
+    replay = client.post("/gringotts/host-side-effect", headers=headers)
+
+    assert replay.status_code == 409
+    assert replay.headers.get("idempotent-replayed") is None
+    assert calls == 1
+
+
+def test_revoked_caller_cannot_rerun_completed_operation(db_session):
+    user, key = auth.create_user_with_key(db_session, "revoked", credits=0)
+    app = FastAPI()
+    gringotts.init_app(app, replay_config())
+    calls = 0
+
+    @app.post("/once-after-revoke")
+    def once_after_revoke():
+        nonlocal calls
+        calls += 1
+        return {"calls": calls}
+
+    client = TestClient(app)
+    headers = {"X-API-Key": key, "Idempotency-Key": "revoked-key"}
+    assert client.post("/once-after-revoke", headers=headers).status_code == 200
+    user.api_key_hash = "revoked"
+    db_session.commit()
+    retry = client.post("/once-after-revoke", headers=headers)
+
+    assert retry.status_code == 401
+    assert calls == 1
+
+
 def test_expired_record_reruns(db_session):
     app = FastAPI()
-    gringotts.init_app(app, GringottsConfig(idempotency_retention_seconds=0))
+    gringotts.init_app(app, replay_config(idempotency_retention_seconds=0))
 
     @app.get("/e")
     def e(user: CreditedUser = Depends(charge(2))):
@@ -413,7 +543,7 @@ def test_retention_starts_when_response_is_stored(db_session, monkeypatch):
 
     monkeypatch.setattr(idempotency_module, "datetime", Clock)
     app = FastAPI()
-    gringotts.init_app(app, GringottsConfig(idempotency_retention_seconds=86_400))
+    gringotts.init_app(app, replay_config(idempotency_retention_seconds=86_400))
 
     @app.post("/slow")
     def slow(user: CreditedUser = Depends(charge(2))):
@@ -474,7 +604,7 @@ def test_pruned_expired_record_is_claimed_without_spurious_conflict(
 
 def test_response_over_cap_keeps_lock_and_charges_once(db_session):
     app = FastAPI()
-    gringotts.init_app(app, GringottsConfig(idempotency_max_response_bytes=10))
+    gringotts.init_app(app, replay_config(idempotency_max_response_bytes=10))
 
     @app.get("/big")
     def big(user: CreditedUser = Depends(charge(2))):
@@ -493,7 +623,7 @@ def test_response_over_cap_keeps_lock_and_charges_once(db_session):
 
 def test_body_over_cap_is_rejected_not_run(db_session):
     app = FastAPI()
-    gringotts.init_app(app, GringottsConfig(idempotency_max_body_bytes=10))
+    gringotts.init_app(app, replay_config(idempotency_max_body_bytes=10))
 
     ran = {"n": 0}
 
@@ -557,7 +687,7 @@ def test_returned_5xx_is_cached_and_charges_once(db_session):
     from fastapi.responses import JSONResponse
 
     app = FastAPI()
-    gringotts.init_app(app, GringottsConfig())
+    gringotts.init_app(app, replay_config())
     ran = {"n": 0}
 
     @app.get("/ret5xx")
@@ -618,7 +748,7 @@ def test_background_task_failure_refunds_and_does_not_double_charge(db_session):
     from starlette.background import BackgroundTask
 
     app = FastAPI()
-    gringotts.init_app(app, GringottsConfig())
+    gringotts.init_app(app, replay_config())
 
     def boom():
         raise RuntimeError("background failure")
@@ -643,7 +773,7 @@ def test_streaming_response_is_cached_without_hang(db_session):
     from fastapi.responses import StreamingResponse
 
     app = FastAPI()
-    gringotts.init_app(app, GringottsConfig())
+    gringotts.init_app(app, replay_config())
 
     @app.get("/stream")
     def stream(user: CreditedUser = Depends(charge(2))):
@@ -700,7 +830,7 @@ def test_interrupted_stream_refunds_and_releases_key(db_session):
     from fastapi.responses import StreamingResponse
 
     app = FastAPI()
-    gringotts.init_app(app, GringottsConfig())
+    gringotts.init_app(app, replay_config())
 
     @app.get("/partial")
     def partial(user: CreditedUser = Depends(charge(2))):
@@ -766,7 +896,7 @@ def test_httpexception_5xx_releases_key(db_session):
     from fastapi import HTTPException
 
     app = FastAPI()
-    gringotts.init_app(app, GringottsConfig())
+    gringotts.init_app(app, replay_config())
     calls = {"n": 0}
 
     @app.get("/svc")
@@ -789,7 +919,7 @@ def test_slash_redirect_does_not_conflict(db_session):
     # FastAPI auto-redirects POST /x -> /x/; the client follows with the same key,
     # and the redirect must not be cached as a conflicting key reuse
     app = FastAPI()
-    gringotts.init_app(app, GringottsConfig())
+    gringotts.init_app(app, replay_config())
 
     @app.post("/x/")
     def x(user: CreditedUser = Depends(charge(2))):
@@ -807,7 +937,7 @@ def test_slash_redirect_does_not_conflict(db_session):
 
 def test_percent_encoded_slash_redirect_does_not_conflict(db_session):
     app = FastAPI()
-    gringotts.init_app(app, GringottsConfig())
+    gringotts.init_app(app, replay_config())
 
     @app.post("/東京/")
     def tokyo(user: CreditedUser = Depends(charge(1))):
@@ -833,7 +963,7 @@ def test_endpoint_slash_redirect_after_charge_is_cached(db_session):
     from fastapi.responses import RedirectResponse
 
     app = FastAPI()
-    gringotts.init_app(app, GringottsConfig())
+    gringotts.init_app(app, replay_config())
 
     @app.get("/y")
     def y(user: CreditedUser = Depends(charge(2))):
@@ -858,7 +988,7 @@ def test_endpoint_slash_redirect_without_charge_is_cached(db_session):
     from fastapi.responses import RedirectResponse
 
     app = FastAPI()
-    gringotts.init_app(app, GringottsConfig())
+    gringotts.init_app(app, replay_config())
     calls = 0
 
     @app.post("/z")
@@ -881,7 +1011,7 @@ def test_refund_failure_keeps_key_locked(db_session, monkeypatch):
     # if compensation itself fails, the charge still stands, so the key must NOT be
     # released — a retry would otherwise charge again on top of the un-refunded debit
     app = FastAPI()
-    gringotts.init_app(app, GringottsConfig())
+    gringotts.init_app(app, replay_config())
 
     @app.get("/rf")
     def rf(user: CreditedUser = Depends(charge(2))):
@@ -905,7 +1035,7 @@ def test_partial_refund_across_multiple_charges_keeps_key_locked(
     db_session, monkeypatch
 ):
     app = FastAPI()
-    gringotts.init_app(app, GringottsConfig())
+    gringotts.init_app(app, replay_config())
     calls = 0
 
     @app.get("/multi-refund")
@@ -954,7 +1084,7 @@ def test_partial_refund_across_multiple_charges_keeps_key_locked(
 
 def test_full_refund_across_multiple_charges_releases_key(db_session):
     app = FastAPI()
-    gringotts.init_app(app, GringottsConfig())
+    gringotts.init_app(app, replay_config())
     calls = 0
 
     @app.get("/multi-retry")
@@ -1027,9 +1157,21 @@ def test_fingerprint_no_collision_with_null_bytes():
     assert a != b
 
 
+def test_fingerprint_canonicalizes_distinct_header_order():
+    a = _fingerprint("POST", "/x", b"", b"", [(b"x-first", b"1"), (b"x-second", b"2")])
+    b = _fingerprint("POST", "/x", b"", b"", [(b"x-second", b"2"), (b"x-first", b"1")])
+    assert a == b
+
+
+def test_fingerprint_preserves_repeated_header_value_order():
+    a = _fingerprint("POST", "/x", b"", b"", [(b"x-value", b"1"), (b"x-value", b"2")])
+    b = _fingerprint("POST", "/x", b"", b"", [(b"x-value", b"2"), (b"x-value", b"1")])
+    assert a != b
+
+
 def test_bodyless_status_stores_no_marker_body(db_session):
     app = FastAPI()
-    gringotts.init_app(app, GringottsConfig())
+    gringotts.init_app(app, replay_config())
 
     @app.get("/nc")
     def nc(user: CreditedUser = Depends(charge(1))):

@@ -42,6 +42,22 @@ the first request runs and its response is stored; the retry returns that stored
 response without re-running the handler — so the charge happens once and the retry
 gets the original result back (with an `Idempotent-Replayed: true` header):
 
+For host routes, configure a synchronous validator that rechecks mutable
+authorization before cached data is returned. If `X-API-Key` is the only such
+state, Gringotts already validates it and the callback can allow replay:
+
+```python
+gringotts.init_app(
+    app,
+    GringottsConfig(idempotency_replay_validator=lambda _scope: True),
+)
+```
+
+Without a validator, the first operation still runs once and remains locked, but
+a retry returns `409` instead of bypassing host authorization to expose cached
+data. Built-in Gringotts routes revalidate their own authorization and need no
+callback.
+
 ```bash
 # both calls together charge once; the second returns the first's response
 curl -X POST localhost:8000/predict \

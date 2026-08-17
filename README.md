@@ -23,7 +23,11 @@ app = FastAPI()
 
 gringotts.init_app(
     app,
-    GringottsConfig(packs=[CreditPack(credits=100, price_cents=500, name="Starter")]),
+    GringottsConfig(
+        packs=[CreditPack(credits=100, price_cents=500, name="Starter")],
+        # X-API-Key is this example app's only mutable authorization state.
+        idempotency_replay_validator=lambda _scope: True,
+    ),
 )
 
 
@@ -227,6 +231,7 @@ concurrent writers wait rather than erroring with "database is locked."
 | `packs` | `GringottsConfig(packs=[CreditPack(...)])` | `[]` |
 | `success_url` / `cancel_url` | `GringottsConfig` | back to the purchase page |
 | `mount_path` | `GringottsConfig` | `/gringotts` |
+| `idempotency_replay_validator` | `GringottsConfig` | `None` (host retries stay locked and return `409`) |
 
 ## CLI
 

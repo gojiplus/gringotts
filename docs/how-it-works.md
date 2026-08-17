@@ -23,6 +23,11 @@ Four tables hold everything:
 So the cached `credits` is a fast read, but the ledger is the source of truth:
 the sum of a user's `amount` values always equals their balance.
 
+Built-in routes revalidate API-key and admin authorization before replaying a
+stored response. Host routes must provide `idempotency_replay_validator` to
+revalidate mutable authorization; without one, retries return `409` while the
+lock still prevents duplicate execution.
+
 ## Running balance and three-way reconcile
 
 Each ledger row also stores **`balance_after`** — the user's balance immediately
