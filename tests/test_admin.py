@@ -58,6 +58,20 @@ def test_admin_routes_reject_non_admins(db_session):
     )
 
 
+def test_admin_replay_conflicts_after_privilege_revocation(db_session):
+    admin, key = make_admin(db_session)
+    client = TestClient(make_app())
+    headers = {"X-API-Key": key, "Idempotency-Key": "admin-list"}
+
+    first = client.get("/gringotts/admin/users", headers=headers)
+    crud.set_admin(db_session, admin, False)
+    replay = client.get("/gringotts/admin/users", headers=headers)
+
+    assert first.status_code == 200
+    assert replay.status_code == 409
+    assert replay.headers.get("idempotent-replayed") is None
+
+
 def test_admin_users_list_and_stats(db_session):
     _, admin_key = make_admin(db_session)
     user, key = auth.create_user_with_key(db_session, "ada", credits=10)

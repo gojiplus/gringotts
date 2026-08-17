@@ -177,6 +177,33 @@ def test_keyed_checkout_replays_form_authenticated_session(db_session, monkeypat
     assert record.api_key_hash == auth.get_api_key_hash(key)
 
 
+def test_keyed_checkout_replays_when_app_is_mounted(db_session, monkeypatch):
+    _, key = auth.create_user_with_key(db_session, "checkout-mounted", credits=0)
+    calls = []
+
+    def fake_create(**kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(
+            id=f"cs_mounted_{len(calls)}", url=f"https://checkout.test/{len(calls)}"
+        )
+
+    monkeypatch.setattr("stripe.checkout.Session.create", fake_create)
+    parent = FastAPI()
+    parent.mount("/api", make_app())
+    client = TestClient(parent, follow_redirects=False)
+    headers = {"Idempotency-Key": "mounted-checkout"}
+    data = {"api_key": key, "pack": "0"}
+
+    first = client.post("/api/gringotts/checkout", data=data, headers=headers)
+    replay = client.post("/api/gringotts/checkout", data=data, headers=headers)
+
+    assert first.status_code == 303
+    assert replay.status_code == 303
+    assert replay.headers.get("idempotent-replayed") == "true"
+    assert len(calls) == 1
+    assert db_session.query(models.CheckoutOrder).count() == 1
+
+
 def test_keyed_checkout_with_unparseable_form_never_runs(db_session, monkeypatch):
     _, key = auth.create_user_with_key(db_session, "checkout-fields", credits=0)
     calls = []

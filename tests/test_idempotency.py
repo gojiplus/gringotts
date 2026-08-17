@@ -25,7 +25,7 @@ from gringotts.db import Base, make_engine
 from gringotts.idempotency import IdempotencyMiddleware, _fingerprint
 
 
-def _client_fingerprint(client, method, path, headers):
+def _client_fingerprint(client, method, path, headers, *, is_admin=False):
     request = client.build_request(method, path, headers=headers)
     fingerprint_headers = [
         (name, value)
@@ -38,6 +38,7 @@ def _client_fingerprint(client, method, path, headers):
         request.url.query,
         request.content,
         fingerprint_headers,
+        b"admin:1" if is_admin else b"admin:0",
     )
 
 
@@ -286,14 +287,16 @@ def test_concurrent_first_attempts_run_handler_once(tmp_path, monkeypatch):
     # unique (caller, key) row. This exercises the actual insert race rather than
     # merely sending a duplicate after the first request is already in flight.
     barrier = threading.Barrier(2)
-    original = IdempotencyMiddleware._caller_exists
+    original = IdempotencyMiddleware._caller_context
 
-    def caller_exists_together(self, api_key):
-        exists = original(self, api_key)
+    def caller_context_together(self, api_key):
+        context = original(self, api_key)
         barrier.wait(timeout=10)
-        return exists
+        return context
 
-    monkeypatch.setattr(IdempotencyMiddleware, "_caller_exists", caller_exists_together)
+    monkeypatch.setattr(
+        IdempotencyMiddleware, "_caller_context", caller_context_together
+    )
     headers = {"X-API-Key": key, "Idempotency-Key": "same-first-attempt"}
 
     def request_once(_):
@@ -345,6 +348,18 @@ def test_invalid_key_creates_no_record(db_session):
     client = TestClient(make_app())
     r = client.get("/hello", headers={"X-API-Key": "gk_bogus", "Idempotency-Key": "z"})
     assert r.status_code == 401
+    assert db_session.query(models.IdempotencyRecord).count() == 0
+
+
+def test_empty_key_is_rejected_before_charge(db_session):
+    user, key = auth.create_user_with_key(db_session, "empty-key", credits=10)
+    response = TestClient(make_app()).get(
+        "/hello", headers={"X-API-Key": key, "Idempotency-Key": ""}
+    )
+
+    assert response.status_code == 400
+    db_session.refresh(user)
+    assert user.credits == 10
     assert db_session.query(models.IdempotencyRecord).count() == 0
 
 

@@ -80,6 +80,7 @@ _IN_PROGRESS_BODY = json.dumps(
     {"detail": "A request with this Idempotency-Key is still in progress"}
 ).encode()
 _KEY_TOO_LONG_BODY = json.dumps({"detail": "Idempotency-Key is too long"}).encode()
+_EMPTY_KEY_BODY = json.dumps({"detail": "Idempotency-Key cannot be empty"}).encode()
 _BODY_TOO_LARGE_BODY = json.dumps(
     {"detail": "Request body too large for an idempotent request"}
 ).encode()
@@ -100,6 +101,7 @@ def _fingerprint(
     query: bytes,
     body: bytes,
     headers: list[tuple[bytes, bytes]] | None = None,
+    caller_context: bytes = b"",
 ) -> str:
     """SHA-256 over the parts of a request that define its identity.
 
@@ -109,7 +111,7 @@ def _fingerprint(
     deduplicated.
     """
     digest = hashlib.sha256()
-    parts = [method.encode(), path.encode(), query, body]
+    parts = [method.encode(), path.encode(), query, body, caller_context]
     request_headers = headers or []
     parts.append(len(request_headers).to_bytes(8, "big"))
     for name, value in request_headers:
@@ -170,8 +172,11 @@ class IdempotencyMiddleware:
                 raw_key = value
             elif lname == self.api_key_header and raw_api_key is None:
                 raw_api_key = value
-        if not raw_key:
+        if raw_key is None:
             await self.app(scope, receive, send)
+            return
+        if not raw_key:
+            await self._send(send, 400, _EMPTY_KEY_BODY, _JSON)
             return
 
         if len(raw_key) > self.max_key_length:
@@ -179,7 +184,11 @@ class IdempotencyMiddleware:
             return
 
         body = None
-        form_authenticated = scope["path"] == self.form_api_key_path
+        request_path = scope["path"]
+        root_path = scope.get("root_path", "").rstrip("/")
+        if root_path and request_path.startswith(f"{root_path}/"):
+            request_path = request_path[len(root_path) :]
+        form_authenticated = request_path == self.form_api_key_path
         if form_authenticated:
             # The built-in Checkout route authenticates with its browser form,
             # not X-API-Key. Buffer that keyed request first and scope the record
@@ -207,7 +216,8 @@ class IdempotencyMiddleware:
 
         # Validate the caller before touching the table: an invalid key must not
         # be able to create records, so it just falls through to the app's 401.
-        if not await run_in_threadpool(self._caller_exists, api_key):
+        caller_context = await run_in_threadpool(self._caller_context, api_key)
+        if caller_context is None:
             app_receive = _body_replayer(body, receive) if body is not None else receive
             await self.app(scope, app_receive, send)
             return
@@ -243,6 +253,7 @@ class IdempotencyMiddleware:
             scope.get("query_string", b""),
             body,
             fingerprint_headers,
+            caller_context,
         )
         outcome, claim, stored = await run_in_threadpool(
             self._claim, api_key_hash, key, fingerprint
@@ -385,15 +396,19 @@ class IdempotencyMiddleware:
         )
         await send({"type": "http.response.body", "body": body})
 
-    def _caller_exists(self, api_key: str) -> bool:
-        """Whether the API key belongs to a real account. Runs in a worker thread."""
+    def _caller_context(self, api_key: str) -> bytes | None:
+        """Return authorization state for a real caller; run in a worker thread."""
         session = db.SessionLocal()
         try:
             hash_ = auth.get_api_key_hash(api_key)
-            return (
-                session.query(User.id).filter(User.api_key_hash == hash_).first()
-                is not None
+            row = (
+                session.query(User.is_admin).filter(User.api_key_hash == hash_).first()
             )
+            if row is None:
+                return None
+            # Bind mutable built-in authorization to the cached response. Revoking
+            # admin access then conflicts instead of replaying privileged data.
+            return b"admin:1" if row[0] else b"admin:0"
         finally:
             session.close()
 
