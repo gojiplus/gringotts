@@ -58,13 +58,33 @@ def test_admin_routes_reject_non_admins(db_session):
     )
 
 
+def test_admin_replay_conflicts_after_privilege_revocation(db_session):
+    admin, key = make_admin(db_session)
+    client = TestClient(make_app())
+    headers = {"X-API-Key": key, "Idempotency-Key": "admin-list"}
+
+    first = client.get("/gringotts/admin/users", headers=headers)
+    crud.set_admin(db_session, admin, False)
+    replay = client.get("/gringotts/admin/users", headers=headers)
+
+    assert first.status_code == 200
+    assert replay.status_code == 409
+    assert replay.headers.get("idempotent-replayed") is None
+
+
 def test_admin_users_list_and_stats(db_session):
     _, admin_key = make_admin(db_session)
     user, key = auth.create_user_with_key(db_session, "ada", credits=10)
     client = TestClient(make_app())
     client.get("/hello", headers={"X-API-Key": key})
     crud.grant_credits(
-        db_session, user, 100, kind="purchase", external_id="evt_a", amount_cents=500
+        db_session,
+        user,
+        100,
+        kind="purchase",
+        external_id="evt_a",
+        amount_cents=500,
+        currency="usd",
     )
 
     users = client.get(
@@ -82,7 +102,7 @@ def test_admin_users_list_and_stats(db_session):
     assert stats["credits_outstanding"] == 108
     assert stats["credits_consumed"] == 2
     assert stats["credits_purchased"] == 100
-    assert stats["revenue_cents"] == 500
+    assert stats["revenue_by_currency"] == {"usd": 500}
 
 
 def test_admin_create_user_key_works_immediately(db_session):

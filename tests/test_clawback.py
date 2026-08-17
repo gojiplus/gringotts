@@ -9,7 +9,9 @@ from sqlalchemy.orm import sessionmaker
 from test_router import WEBHOOK_SECRET, make_app, sign
 
 from gringotts import auth, crud, models
+from gringotts import db as gdb
 from gringotts.db import Base, make_engine
+from gringotts.router import _round_proportional
 
 
 def test_concurrent_partial_refunds_do_not_over_claw(tmp_path):
@@ -74,7 +76,9 @@ def _client():
     return TestClient(make_app())
 
 
-def _purchase_event(user_id, credits, pi, session_id="cs_p", event_id="evt_p"):
+def _purchase_event(
+    user_id, credits, pi, order_id, session_id="cs_p", event_id="evt_p"
+):
     return json.dumps(
         {
             "id": event_id,
@@ -86,9 +90,12 @@ def _purchase_event(user_id, credits, pi, session_id="cs_p", event_id="evt_p"):
                     "id": session_id,
                     "object": "checkout.session",
                     "amount_total": 500,
+                    "currency": "usd",
                     "payment_status": "paid",
                     "payment_intent": pi,
+                    "client_reference_id": order_id,
                     "metadata": {
+                        "gringotts_order_id": order_id,
                         "gringotts_user_id": str(user_id),
                         "credits": str(credits),
                     },
@@ -110,6 +117,7 @@ def _refund_event(pi, amount, refund_id="re_1", event_id="evt_r"):
                     "object": "refund",
                     "payment_intent": pi,
                     "amount": amount,
+                    "status": "succeeded",
                 }
             },
         }
@@ -144,7 +152,20 @@ def _post(client, payload):
 
 def _buy(db, client, name, credits=100, pi="pi_1"):
     user, _ = auth.create_user_with_key(db, name, credits=0)
-    assert _post(client, _purchase_event(user.id, credits, pi)).status_code == 200
+    order = models.CheckoutOrder(
+        id=f"order_{pi}",
+        stripe_session_id="cs_p",
+        user_id=user.id,
+        credits=credits,
+        amount_cents=500,
+        currency="usd",
+    )
+    db.add(order)
+    db.commit()
+    assert (
+        _post(client, _purchase_event(user.id, credits, pi, order.id)).status_code
+        == 200
+    )
     db.refresh(user)
     assert user.credits == credits
     return user
@@ -156,6 +177,15 @@ def test_purchase_stores_payment_intent(db_session):
     assert row.payment_intent_id == "pi_1"
     assert row.amount == 100
     assert row.amount_cents == 500
+    assert row.currency == "usd"
+
+
+def test_proportional_rounding_is_exact_above_float_precision():
+    credits = 9_007_199_254_740_993
+    assert (
+        _round_proportional(credits, 33_333_333, 100_000_000) == 3_002_399_721_556_333
+    )
+    assert round(credits * 33_333_333 / 100_000_000) != 3_002_399_721_556_333
 
 
 def test_full_refund_claws_back_all(db_session):
@@ -249,6 +279,16 @@ def test_multiple_partial_refunds_do_not_over_claw(db_session):
     # claw 2+2+2=6; cumulative delta math caps the total at 5.
     client = _client()
     user, _ = auth.create_user_with_key(db_session, "p8", credits=0)
+    order = models.CheckoutOrder(
+        id="order_small",
+        stripe_session_id="cs_small",
+        user_id=user.id,
+        credits=5,
+        amount_cents=3,
+        currency="usd",
+    )
+    db_session.add(order)
+    db_session.commit()
     payload = json.dumps(
         {
             "id": "evt_small",
@@ -259,9 +299,15 @@ def test_multiple_partial_refunds_do_not_over_claw(db_session):
                     "id": "cs_small",
                     "object": "checkout.session",
                     "amount_total": 3,
+                    "currency": "usd",
                     "payment_status": "paid",
                     "payment_intent": "pi_small",
-                    "metadata": {"gringotts_user_id": str(user.id), "credits": "5"},
+                    "client_reference_id": order.id,
+                    "metadata": {
+                        "gringotts_order_id": order.id,
+                        "gringotts_user_id": str(user.id),
+                        "credits": "5",
+                    },
                 }
             },
         }
@@ -290,6 +336,93 @@ def test_pending_refund_is_not_clawed_until_succeeded(db_session):
     succeeded["type"] = "refund.updated"
     succeeded["data"]["object"]["status"] = "succeeded"
     assert _post(client, json.dumps(succeeded).encode()).status_code == 200
+    db_session.refresh(user)
+    assert user.credits == 0
+
+
+def test_refund_without_status_retrieves_current_object(db_session, monkeypatch):
+    client = _client()
+    user = _buy(db_session, client, "p_missing_status")
+    refund = json.loads(_refund_event("pi_1", 500).decode())
+    del refund["data"]["object"]["status"]
+
+    def retrieve(refund_id, *, api_key):
+        assert refund_id == "re_1"
+        assert api_key == "sk_test_x"
+        return {
+            "id": refund_id,
+            "object": "refund",
+            "payment_intent": "pi_1",
+            "amount": 500,
+            "status": "succeeded",
+        }
+
+    monkeypatch.setattr("stripe.Refund.retrieve", retrieve)
+    assert _post(client, json.dumps(refund).encode()).status_code == 200
+    db_session.refresh(user)
+    assert user.credits == 0
+
+
+def test_refund_still_missing_status_after_retrieval_asks_retry(
+    db_session, monkeypatch
+):
+    client = _client()
+    user = _buy(db_session, client, "p_status_unavailable")
+    refund = json.loads(_refund_event("pi_1", 500).decode())
+    del refund["data"]["object"]["status"]
+    monkeypatch.setattr("stripe.Refund.retrieve", lambda *args, **kwargs: refund)
+
+    assert _post(client, json.dumps(refund).encode()).status_code == 503
+    db_session.refresh(user)
+    assert user.credits == 100
+
+
+def test_refund_missing_accounting_field_retrieves_current_object(
+    db_session, monkeypatch
+):
+    client = _client()
+    user = _buy(db_session, client, "p_missing_amount")
+    refund = json.loads(_refund_event("pi_1", 500).decode())
+    del refund["data"]["object"]["amount"]
+
+    monkeypatch.setattr(
+        "stripe.Refund.retrieve",
+        lambda *args, **kwargs: {
+            "id": "re_1",
+            "object": "refund",
+            "payment_intent": "pi_1",
+            "amount": 500,
+            "status": "succeeded",
+        },
+    )
+
+    assert _post(client, json.dumps(refund).encode()).status_code == 200
+    db_session.refresh(user)
+    assert user.credits == 0
+
+
+def test_dispute_missing_accounting_field_retrieves_current_object(
+    db_session, monkeypatch
+):
+    client = _client()
+    user = _buy(db_session, client, "p_missing_dispute_amount")
+    dispute = json.loads(
+        _dispute_event("pi_1", "charge.dispute.funds_withdrawn").decode()
+    )
+    del dispute["data"]["object"]["amount"]
+
+    def retrieve(dispute_id, *, api_key):
+        assert dispute_id == "du_1"
+        assert api_key == "sk_test_x"
+        return {
+            "id": dispute_id,
+            "object": "dispute",
+            "payment_intent": "pi_1",
+            "amount": 500,
+        }
+
+    monkeypatch.setattr("stripe.Dispute.retrieve", retrieve)
+    assert _post(client, json.dumps(dispute).encode()).status_code == 200
     db_session.refresh(user)
     assert user.credits == 0
 
@@ -338,6 +471,63 @@ def test_refund_after_reinstated_dispute_claws_correctly(db_session):
     assert crud.find_balance_discrepancies(db_session) == []
 
 
+def test_refund_before_dispute_reinstatement_remains_clawed(db_session):
+    client = _client()
+    user = _buy(db_session, client, "pr")  # 100 credits / 500 cents
+    _post(client, _dispute_event("pi_1", "charge.dispute.funds_withdrawn"))
+    _post(client, _refund_event("pi_1", 250))
+    _post(client, _dispute_event("pi_1", "charge.dispute.funds_reinstated"))
+
+    db_session.refresh(user)
+    assert user.credits == 50
+    assert crud.find_balance_discrepancies(db_session) == []
+
+
+def test_concurrent_refund_and_dispute_reinstatement_are_order_independent(
+    tmp_path, monkeypatch
+):
+    url = os.getenv("GRINGOTTS_TEST_DATABASE_URL") or f"sqlite:///{tmp_path}/race.db"
+    engine = make_engine(url)
+    session_local = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    Base.metadata.drop_all(bind=engine)
+    Base.metadata.create_all(bind=engine)
+    monkeypatch.setattr(gdb, "SessionLocal", session_local)
+
+    with session_local() as setup:
+        user = _buy(setup, _client(), "concurrent", pi="pi_concurrent")
+        user_id = user.id
+        withdrawn = _dispute_event(
+            "pi_concurrent",
+            "charge.dispute.funds_withdrawn",
+            dispute_id="du_concurrent",
+            event_id="evt_withdrawn",
+        )
+        assert _post(_client(), withdrawn).status_code == 200
+
+    refund = _refund_event(
+        "pi_concurrent", 250, refund_id="re_concurrent", event_id="evt_refund"
+    )
+    reinstated = _dispute_event(
+        "pi_concurrent",
+        "charge.dispute.funds_reinstated",
+        dispute_id="du_concurrent",
+        event_id="evt_reinstated",
+    )
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        statuses = list(
+            pool.map(
+                lambda payload: _post(_client(), payload).status_code,
+                (refund, reinstated),
+            )
+        )
+
+    assert statuses == [200, 200]
+    with session_local() as check:
+        assert crud.get_user(check, user_id).credits == 50
+        assert crud.find_balance_discrepancies(check) == []
+    engine.dispose()
+
+
 def test_null_payment_intent_does_not_claw_unrelated_user(db_session):
     # a pre-0.3 purchase row (payment_intent_id NULL) must never be matched by a
     # reversal whose payment_intent is also null.
@@ -378,9 +568,9 @@ def test_stats_net_clawbacks_from_purchased_and_revenue(db_session):
     user = _buy(db_session, client, "pc")  # purchased 100 for 500 cents
     stats = crud.aggregate_stats(db_session)
     assert stats["credits_purchased"] == 100
-    assert stats["revenue_cents"] == 500
+    assert stats["revenue_by_currency"] == {"usd": 500}
     _post(client, _refund_event("pi_1", 500))  # full refund
     db_session.refresh(user)
     stats = crud.aggregate_stats(db_session)
     assert stats["credits_purchased"] == 0  # credits netted
-    assert stats["revenue_cents"] == 0  # revenue netted
+    assert stats["revenue_by_currency"] == {"usd": 0}  # revenue netted

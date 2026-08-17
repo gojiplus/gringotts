@@ -1,3 +1,4 @@
+import pytest
 from sqlalchemy import func
 
 from gringotts import auth, cli, crud, models
@@ -37,9 +38,9 @@ def test_get_user_by_api_key(db_session):
 
 def test_charge_user_atomic_with_ledger(db_session):
     user, _ = auth.create_user_with_key(db_session, "dave", credits=3)
-    assert crud.charge_user(db_session, user, 2, endpoint="/x")
+    assert crud.charge_user(db_session, user, 2, endpoint="/x") is True
     assert user.credits == 1
-    assert not crud.charge_user(db_session, user, 5, endpoint="/x")
+    assert crud.charge_user(db_session, user, 5, endpoint="/x") is False
     db_session.refresh(user)
     assert user.credits == 1
     assert ledger_sum(db_session, user.id) == user.credits
@@ -51,6 +52,23 @@ def test_charge_user_atomic_with_ledger(db_session):
     assert len(charge_rows) == 1
     assert charge_rows[0].amount == -2
     assert charge_rows[0].endpoint == "/x"
+
+
+@pytest.mark.parametrize("amount", [1.5, "2", True])
+@pytest.mark.parametrize(
+    "operation",
+    [crud.charge_user, crud.refund_user, crud.grant_credits, crud.clawback_credits],
+)
+def test_credit_movements_reject_non_integer_amounts(db_session, amount, operation):
+    user, _ = auth.create_user_with_key(db_session, "typed", credits=5)
+    kwargs = {"external_id": "typed"} if operation is crud.clawback_credits else {}
+
+    with pytest.raises(TypeError, match="amount must be an integer"):
+        operation(db_session, user, amount, **kwargs)
+
+    db_session.refresh(user)
+    assert user.credits == 5
+    assert ledger_sum(db_session, user.id) == 5
 
 
 def test_grant_credits_idempotent_by_external_id(db_session):

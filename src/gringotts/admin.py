@@ -66,13 +66,26 @@ def build_admin_router(config: GringottsConfig) -> APIRouter:
         data = crud.aggregate_stats(db)
         if not _is_htmx(request):
             return JSONResponse(data)
-        currency = config.packs[0].currency if config.packs else "usd"
+        revenue = data["revenue_by_currency"]
+        if not revenue and config.packs:
+            revenue = {config.packs[0].currency: 0}
+        revenue_tiles = "".join(
+            pages.tile(
+                (
+                    f"{amount:,} minor units"
+                    if currency == "unknown"
+                    else format_money(amount, currency)
+                ),
+                "revenue" if len(revenue) == 1 else f"revenue ({currency.upper()})",
+            )
+            for currency, amount in revenue.items()
+        )
         tiles = (
             pages.tile(str(data["users"]), "users")
             + pages.tile(str(data["credits_outstanding"]), "credits outstanding")
             + pages.tile(str(data["credits_consumed"]), "credits consumed")
             + pages.tile(str(data["credits_purchased"]), "credits purchased")
-            + pages.tile(format_money(data["revenue_cents"], currency), "revenue")
+            + revenue_tiles
         )
         return HTMLResponse(f'<div class="tiles">{tiles}</div>')
 
@@ -122,6 +135,9 @@ def build_admin_router(config: GringottsConfig) -> APIRouter:
         user, api_key = auth.create_user_with_key(
             db, username, credits, is_admin=is_admin
         )
+        # The response carries the one-time API key; no-store keeps the idempotency
+        # middleware from persisting that secret in its response cache.
+        no_store = {"Cache-Control": "no-store"}
         if not _is_htmx(request):
             return JSONResponse(
                 {
@@ -132,13 +148,16 @@ def build_admin_router(config: GringottsConfig) -> APIRouter:
                     "api_key": api_key,
                 },
                 status_code=201,
+                headers=no_store,
             )
         fragment = (
             f"<p>Created <strong>{html.escape(user.username)}</strong>."
             " API key (shown once):</p>"
             f'<div class="keyreveal">{html.escape(api_key)}</div>'
         )
-        return HTMLResponse(fragment, headers={"HX-Trigger": "users-changed"})
+        return HTMLResponse(
+            fragment, headers={"HX-Trigger": "users-changed", **no_store}
+        )
 
     @router.post("/admin/users/{user_id}/grant")
     def grant(
@@ -153,7 +172,10 @@ def build_admin_router(config: GringottsConfig) -> APIRouter:
         user = crud.get_user(db, user_id)
         if user is None:
             raise HTTPException(status_code=404, detail="User not found")
+        # Retried grants are made safe by IdempotencyMiddleware: a repeat with the
+        # same Idempotency-Key returns this response without re-running the grant.
         crud.grant_credits(db, user, amount)
+        db.refresh(user)
         if not _is_htmx(request):
             return JSONResponse({"id": user.id, "balance": user.credits})
         return users(request, admin, db)
@@ -181,6 +203,7 @@ def build_admin_router(config: GringottsConfig) -> APIRouter:
                     "kind": t.kind,
                     "endpoint": t.endpoint,
                     "amount_cents": t.amount_cents,
+                    "currency": t.currency,
                     "created_at": t.created_at.isoformat(),
                 }
                 for t in transactions

@@ -33,6 +33,119 @@ _DISPUTE_WITHDRAWN = "charge.dispute.funds_withdrawn"
 _DISPUTE_REINSTATED = "charge.dispute.funds_reinstated"
 
 
+def _round_proportional(value: int, numerator: int, denominator: int) -> int:
+    """Return ``round(value * numerator / denominator)`` using exact integers."""
+    if value < 0 or numerator < 0 or denominator <= 0:
+        raise ValueError("proportional rounding requires non-negative values")
+    quotient, remainder = divmod(value * numerator, denominator)
+    twice_remainder = remainder * 2
+    if twice_remainder > denominator or (
+        twice_remainder == denominator and quotient % 2
+    ):
+        quotient += 1
+    return quotient
+
+
+def _expandable_id(value) -> str | None:
+    """Normalize a Stripe expandable ID represented as a string or object."""
+    if isinstance(value, str):
+        return value or None
+    try:
+        id_ = value["id"]
+    except (KeyError, TypeError):
+        return None
+    return id_ if isinstance(id_, str) and id_ else None
+
+
+def _checkout_fields(session):
+    """Extract the fields required to settle a Checkout Session."""
+    metadata = session["metadata"]
+    order_id = session["client_reference_id"]
+    metadata_order_id = metadata["gringotts_order_id"]
+    user_id = int(metadata["gringotts_user_id"])
+    credits = int(metadata["credits"])
+    session_id = session["id"]
+    payment_status = session["payment_status"]
+    amount_cents = int(session["amount_total"])
+    raw_currency = session["currency"]
+    currency = raw_currency.lower() if isinstance(raw_currency, str) else ""
+    payment_intent_id = _expandable_id(session["payment_intent"])
+    if (
+        not isinstance(order_id, str)
+        or not order_id
+        or metadata_order_id != order_id
+        or not isinstance(session_id, str)
+        or not session_id
+        or not isinstance(payment_status, str)
+        or not payment_status
+        or amount_cents < 0
+        or len(currency) != 3
+        or not currency.isalpha()
+        or (amount_cents and not payment_intent_id)
+    ):
+        raise ValueError("invalid Checkout Session accounting fields")
+    return (
+        order_id,
+        user_id,
+        credits,
+        session_id,
+        payment_status,
+        amount_cents,
+        currency,
+        payment_intent_id,
+    )
+
+
+def _checkout_order_marker(session, db: Session) -> str | None:
+    """Return this library's order marker, or None for unrelated Checkout."""
+    try:
+        metadata_reference = session["metadata"]["gringotts_order_id"]
+    except (KeyError, TypeError):
+        metadata_reference = None
+    if isinstance(metadata_reference, str) and metadata_reference:
+        return metadata_reference
+    try:
+        reference = session["client_reference_id"]
+    except (KeyError, TypeError):
+        return None
+    if (
+        isinstance(reference, str)
+        and reference
+        and crud.get_checkout_order(db, reference) is not None
+    ):
+        # Our immutable event snapshot may be missing metadata. A reference only
+        # identifies Gringotts after it resolves to an order persisted locally;
+        # unrelated Checkout integrations can use their own client references.
+        return reference
+    return None
+
+
+def _retrieve_checkout(session, event_id: str, stripe_secret_key: str | None):
+    """Retrieve a Checkout Session whose immutable event snapshot is incomplete."""
+    try:
+        session_id = session["id"]
+    except (KeyError, TypeError):
+        session_id = None
+    if not isinstance(session_id, str) or not session_id or not stripe_secret_key:
+        logger.error(
+            "gringotts webhook %s: Checkout Session cannot be retrieved", event_id
+        )
+        raise HTTPException(
+            status_code=503, detail="Checkout data incomplete; retry later"
+        )
+    try:
+        return stripe.checkout.Session.retrieve(session_id, api_key=stripe_secret_key)
+    except stripe.StripeError as err:
+        logger.warning(
+            "gringotts webhook %s: could not retrieve Checkout Session %s",
+            event_id,
+            session_id,
+        )
+        raise HTTPException(
+            status_code=503, detail="Checkout data incomplete; retry later"
+        ) from err
+
+
 def _apply_reversal(
     db, event, *, payment_intent, reversed_cents, external_id, endpoint
 ):
@@ -75,7 +188,7 @@ def _apply_reversal(
     granted, paid = purchase.amount, purchase.amount_cents
     prior_cents, prior_clawed = crud.clawback_totals(db, payment_intent)
     capped_cents = min(prior_cents + reversed_cents, paid)
-    target = round(granted * capped_cents / paid)
+    target = _round_proportional(granted, capped_cents, paid)
     delta = max(0, target - prior_clawed)
     crud.clawback_credits(
         db,
@@ -85,23 +198,81 @@ def _apply_reversal(
         endpoint=endpoint,
         amount_cents=reversed_cents,
         payment_intent_id=payment_intent,
+        currency=purchase.currency,
     )
 
 
-def _process_refund(db, event) -> None:
+def _process_refund(db, event, *, stripe_secret_key: str | None) -> None:
     """Claw back credits for a settled Stripe refund (clamped at zero)."""
     refund = event["data"]["object"]
     try:
-        payment_intent = refund["payment_intent"]
+        payment_intent = _expandable_id(refund["payment_intent"])
         refund_id = refund["id"]
         refund_amount = int(refund["amount"])
-    except (KeyError, TypeError, ValueError):
-        logger.error("gringotts webhook %s: refund missing fields", event["id"])
-        return
-    try:
         status = refund["status"]
-    except (KeyError, TypeError):
-        status = "succeeded"  # older API versions omit it; treat as settled
+    except (KeyError, TypeError, ValueError):
+        payment_intent = refund_id = status = None
+        refund_amount = 0
+    if (
+        not payment_intent
+        or not isinstance(refund_id, str)
+        or not refund_id
+        or refund_amount <= 0
+        or not isinstance(status, str)
+        or not status
+    ):
+        try:
+            original_refund_id = refund["id"]
+        except (KeyError, TypeError):
+            original_refund_id = None
+        if (
+            not isinstance(original_refund_id, str)
+            or not original_refund_id
+            or not stripe_secret_key
+        ):
+            logger.error("gringotts webhook %s: refund is incomplete", event["id"])
+            raise HTTPException(
+                status_code=503, detail="Refund data incomplete; retry later"
+            )
+        try:
+            # Event payloads are immutable and retain the webhook endpoint's API
+            # version. Retrieve the current object rather than retrying the same
+            # incomplete snapshot forever.
+            refund = stripe.Refund.retrieve(
+                original_refund_id, api_key=stripe_secret_key
+            )
+            payment_intent = _expandable_id(refund["payment_intent"])
+            refund_id = refund["id"]
+            refund_amount = int(refund["amount"])
+            status = refund["status"]
+        except stripe.StripeError as err:
+            logger.warning(
+                "gringotts webhook %s: could not retrieve refund %s",
+                event["id"],
+                original_refund_id,
+            )
+            raise HTTPException(
+                status_code=503, detail="Refund data incomplete; retry later"
+            ) from err
+        except (KeyError, TypeError, ValueError):
+            payment_intent = refund_id = status = None
+            refund_amount = 0
+        if (
+            not payment_intent
+            or not isinstance(refund_id, str)
+            or not refund_id
+            or refund_amount <= 0
+            or not isinstance(status, str)
+            or not status
+        ):
+            logger.error(
+                "gringotts webhook %s: retrieved refund %s is incomplete",
+                event["id"],
+                original_refund_id,
+            )
+            raise HTTPException(
+                status_code=503, detail="Refund data incomplete; retry later"
+            )
     if status != "succeeded":
         # A pending/failed/canceled refund hasn't returned money — wait for the
         # refund.updated that flips it to succeeded (no row written yet, so that
@@ -123,16 +294,70 @@ def _process_refund(db, event) -> None:
     )
 
 
-def _process_dispute(db, event, *, reinstate: bool) -> None:
+def _process_dispute(
+    db, event, *, reinstate: bool, stripe_secret_key: str | None
+) -> None:
     """Claw back on a withdrawn dispute, re-credit on a reinstated one."""
     dispute = event["data"]["object"]
     try:
-        payment_intent = dispute["payment_intent"]
+        payment_intent = _expandable_id(dispute["payment_intent"])
         dispute_id = dispute["id"]
         dispute_amount = int(dispute["amount"])
     except (KeyError, TypeError, ValueError):
-        logger.error("gringotts webhook %s: dispute missing fields", event["id"])
-        return
+        payment_intent = dispute_id = None
+        dispute_amount = 0
+    if (
+        not payment_intent
+        or not isinstance(dispute_id, str)
+        or not dispute_id
+        or dispute_amount <= 0
+    ):
+        try:
+            original_dispute_id = dispute["id"]
+        except (KeyError, TypeError):
+            original_dispute_id = None
+        if (
+            not isinstance(original_dispute_id, str)
+            or not original_dispute_id
+            or not stripe_secret_key
+        ):
+            logger.error("gringotts webhook %s: dispute is incomplete", event["id"])
+            raise HTTPException(
+                status_code=503, detail="Dispute data incomplete; retry later"
+            )
+        try:
+            dispute = stripe.Dispute.retrieve(
+                original_dispute_id, api_key=stripe_secret_key
+            )
+            payment_intent = _expandable_id(dispute["payment_intent"])
+            dispute_id = dispute["id"]
+            dispute_amount = int(dispute["amount"])
+        except stripe.StripeError as err:
+            logger.warning(
+                "gringotts webhook %s: could not retrieve dispute %s",
+                event["id"],
+                original_dispute_id,
+            )
+            raise HTTPException(
+                status_code=503, detail="Dispute data incomplete; retry later"
+            ) from err
+        except (KeyError, TypeError, ValueError):
+            payment_intent = dispute_id = None
+            dispute_amount = 0
+        if (
+            not payment_intent
+            or not isinstance(dispute_id, str)
+            or not dispute_id
+            or dispute_amount <= 0
+        ):
+            logger.error(
+                "gringotts webhook %s: retrieved dispute %s is incomplete",
+                event["id"],
+                original_dispute_id,
+            )
+            raise HTTPException(
+                status_code=503, detail="Dispute data incomplete; retry later"
+            )
     withdrawn_key = f"{dispute_id}:withdrawn"
     if not reinstate:
         _apply_reversal(
@@ -158,17 +383,32 @@ def _process_dispute(db, event, *, reinstate: bool) -> None:
         )
         raise HTTPException(status_code=503, detail="Withdrawal not seen; retry later")
     purchase = crud.find_purchase_by_payment_intent(db, payment_intent)
+    if purchase is None or not purchase.amount_cents:
+        logger.error(
+            "gringotts webhook %s: reinstate purchase missing or incomplete",
+            event["id"],
+        )
+        raise HTTPException(status_code=503, detail="Purchase not found; retry later")
     # Lock the user before reading/writing, same as _apply_reversal, so a
     # concurrent refund and this reinstatement serialize on the cumulative math.
-    user = crud.lock_user(db, purchase.user_id) if purchase else None
+    user = crud.lock_user(db, purchase.user_id)
     if user is None:
         logger.error("gringotts webhook %s: reinstate user missing", event["id"])
-        return
-    # Always record the reinstatement — even when the withdrawal was clamped to
-    # zero credits — so its negative amount_cents cancels the dispute's
-    # contribution to the cumulative totals. Omitting it would leave the dispute
-    # "active" and over-claw a later refund once the user has credits again.
-    restored = crud.clawback_deducted(db, withdrawn_key)
+        raise HTTPException(status_code=503, detail="User not found; retry later")
+    # Restore only the amount above the target clawback for all *other* active
+    # reversals. A refund can arrive between the dispute withdrawal and its
+    # reinstatement; restoring the withdrawal's original deduction would erase
+    # that refund's clawback and make the result depend on webhook order.
+    prior_cents, prior_clawed = crud.clawback_totals(db, payment_intent)
+    remaining_cents = max(0, prior_cents - dispute_amount)
+    target = _round_proportional(
+        purchase.amount,
+        min(remaining_cents, purchase.amount_cents),
+        purchase.amount_cents,
+    )
+    restored = max(0, prior_clawed - target)
+    # Always record the reinstatement, even when restored is zero, so its negative
+    # amount_cents cancels this dispute in future cumulative calculations.
     crud.grant_credits(
         db,
         user,
@@ -177,6 +417,7 @@ def _process_dispute(db, event, *, reinstate: bool) -> None:
         external_id=f"{dispute_id}:reinstated",
         amount_cents=-dispute_amount,
         payment_intent_id=payment_intent,
+        currency=purchase.currency,
     )
 
 
@@ -257,6 +498,8 @@ def build_router(config: GringottsConfig) -> APIRouter:
                     "amount": t.amount,
                     "kind": t.kind,
                     "endpoint": t.endpoint,
+                    "amount_cents": t.amount_cents,
+                    "currency": t.currency,
                     "created_at": t.created_at.isoformat(),
                 }
                 for t in transactions
@@ -326,9 +569,23 @@ def build_router(config: GringottsConfig) -> APIRouter:
         user = authenticate(db, api_key)
         if not 0 <= pack < len(config.packs):
             raise HTTPException(status_code=400, detail="Unknown credit pack")
-        session = billing.create_checkout_session(
-            user, config.packs[pack], config, str(request.base_url)
+        selected = config.packs[pack]
+        order = crud.create_checkout_order(
+            db,
+            user,
+            selected.credits,
+            selected.price_cents,
+            selected.currency,
         )
+        session = billing.create_checkout_session(
+            user, selected, config, str(request.base_url), order.id
+        )
+        session_id = getattr(session, "id", None)
+        if not isinstance(session_id, str) or not session_id:
+            raise HTTPException(
+                status_code=502, detail="Stripe returned no Checkout Session ID"
+            )
+        crud.bind_checkout_order(db, order.id, session_id, commit=True)
         if not session.url:
             raise HTTPException(
                 status_code=502, detail="Stripe returned no checkout URL"
@@ -354,34 +611,85 @@ def build_router(config: GringottsConfig) -> APIRouter:
 
         if event["type"] in _FULFILL_EVENTS:
             session = event["data"]["object"]
-            # stripe's typed objects raise KeyError (not .get) on missing keys
-            try:
-                metadata = session["metadata"]
-                user_id = int(metadata["gringotts_user_id"])
-                credits = int(metadata["credits"])
-                session_id = session["id"]
-            except (KeyError, TypeError, ValueError):
-                logger.error(
-                    "gringotts webhook %s: missing/invalid metadata; "
-                    "payment cannot be credited",
+            if _checkout_order_marker(session, db) is None:
+                # The Stripe account may host unrelated Checkout integrations.
+                # A valid Stripe signature alone does not authorize credits.
+                logger.info(
+                    "gringotts webhook %s: unrelated Checkout Session ignored",
                     event["id"],
                 )
                 return {"received": True}
-            if credits <= 0:
-                # Our own checkout only ever sets a positive pack size, so a
-                # non-positive value is a corrupt/forged event: log and ack
-                # (do not let it reach grant_credits and 500 into a retry storm).
-                logger.error(
-                    "gringotts webhook %s: non-positive credits=%s in metadata; "
-                    "ignoring",
-                    event["id"],
+            try:
+                (
+                    order_id,
+                    user_id,
                     credits,
+                    session_id,
+                    payment_status,
+                    amount_cents,
+                    currency,
+                    payment_intent_id,
+                ) = _checkout_fields(session)
+            except (KeyError, TypeError, ValueError):
+                session = _retrieve_checkout(
+                    session, event["id"], config.stripe_secret_key
                 )
-                return {"received": True}
+                try:
+                    (
+                        order_id,
+                        user_id,
+                        credits,
+                        session_id,
+                        payment_status,
+                        amount_cents,
+                        currency,
+                        payment_intent_id,
+                    ) = _checkout_fields(session)
+                except (KeyError, TypeError, ValueError):
+                    logger.error(
+                        "gringotts webhook %s: retrieved Checkout Session is "
+                        "incomplete",
+                        event["id"],
+                    )
+                    raise HTTPException(
+                        status_code=503,
+                        detail="Checkout data incomplete; retry later",
+                    ) from None
             try:
-                payment_status = session["payment_status"]
-            except (KeyError, TypeError):
-                payment_status = None
+                order = crud.bind_checkout_order(db, order_id, session_id, commit=False)
+            except ValueError as err:
+                logger.error(
+                    "gringotts webhook %s: Checkout order %s is bound elsewhere",
+                    event["id"],
+                    order_id,
+                )
+                raise HTTPException(
+                    status_code=400, detail="Checkout order mismatch"
+                ) from err
+            if order is None:
+                logger.error(
+                    "gringotts webhook %s: Checkout order %s not found",
+                    event["id"],
+                    order_id,
+                )
+                raise HTTPException(
+                    status_code=503, detail="Checkout order not found; retry later"
+                )
+            if (
+                credits != order.credits
+                or user_id != order.user_id
+                or amount_cents != order.amount_cents
+                or currency != order.currency
+            ):
+                db.rollback()
+                logger.error(
+                    "gringotts webhook %s: Checkout Session %s does not match "
+                    "authorized order %s",
+                    event["id"],
+                    session_id,
+                    order_id,
+                )
+                raise HTTPException(status_code=400, detail="Checkout order mismatch")
             if payment_status not in _PAID_STATUSES:
                 # Not settled yet; wait for async_payment_succeeded.
                 logger.info(
@@ -390,15 +698,7 @@ def build_router(config: GringottsConfig) -> APIRouter:
                     payment_status,
                 )
                 return {"received": True}
-            try:
-                amount_cents = int(session["amount_total"])
-            except (KeyError, TypeError, ValueError):
-                amount_cents = None
-            try:
-                payment_intent_id = session["payment_intent"]
-            except (KeyError, TypeError):
-                payment_intent_id = None
-            user = crud.get_user(db, user_id)
+            user = crud.get_user(db, order.user_id)
             if user is None:
                 # Usually transient (the user existed when checkout was created;
                 # replica lag or a restore in flight). Return non-2xx so Stripe
@@ -407,31 +707,22 @@ def build_router(config: GringottsConfig) -> APIRouter:
                 logger.error(
                     "gringotts webhook %s: user %s not found; asking Stripe to retry",
                     event["id"],
-                    user_id,
+                    order.user_id,
                 )
                 raise HTTPException(
                     status_code=503, detail="User not found; retry later"
                 )
-            # Databases created before 0.2.0 keyed purchases on the Stripe
-            # event id. If this event was already credited under that scheme,
-            # skip it — otherwise re-keying on the session id would double-credit
-            # a payment when Stripe retries across the upgrade boundary.
-            if crud.external_id_exists(db, event["id"]):
-                logger.info(
-                    "gringotts webhook: event %s already credited (legacy key)",
-                    event["id"],
-                )
-                return {"received": True}
             # Idempotency is keyed on the checkout session, not the event id:
             # Stripe may emit several event objects for one session.
             granted = crud.grant_credits(
                 db,
                 user,
-                credits,
+                order.credits,
                 kind="purchase",
                 external_id=session_id,
                 amount_cents=amount_cents,
                 payment_intent_id=payment_intent_id,
+                currency=order.currency,
             )
             if not granted:
                 logger.info(
@@ -439,11 +730,21 @@ def build_router(config: GringottsConfig) -> APIRouter:
                     session_id,
                 )
         elif event["type"] in _REFUND_EVENTS:
-            _process_refund(db, event)
+            _process_refund(db, event, stripe_secret_key=config.stripe_secret_key)
         elif event["type"] == _DISPUTE_WITHDRAWN:
-            _process_dispute(db, event, reinstate=False)
+            _process_dispute(
+                db,
+                event,
+                reinstate=False,
+                stripe_secret_key=config.stripe_secret_key,
+            )
         elif event["type"] == _DISPUTE_REINSTATED:
-            _process_dispute(db, event, reinstate=True)
+            _process_dispute(
+                db,
+                event,
+                reinstate=True,
+                stripe_secret_key=config.stripe_secret_key,
+            )
         return {"received": True}
 
     return router

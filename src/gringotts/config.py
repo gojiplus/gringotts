@@ -1,6 +1,7 @@
 """Library configuration passed to `init_app`."""
 
 import os
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 # Currencies with no minor unit — Stripe's amount is already the whole-unit value
@@ -61,10 +62,21 @@ class CreditPack:
 
     def __post_init__(self) -> None:
         """Reject packs that would charge for nothing or subtract credits."""
+        if isinstance(self.credits, bool) or not isinstance(self.credits, int):
+            raise TypeError("CreditPack.credits must be an integer")
+        if isinstance(self.price_cents, bool) or not isinstance(self.price_cents, int):
+            raise TypeError("CreditPack.price_cents must be an integer")
         if self.credits <= 0:
             raise ValueError("CreditPack.credits must be positive")
         if self.price_cents < 0:
             raise ValueError("CreditPack.price_cents cannot be negative")
+        if (
+            not isinstance(self.currency, str)
+            or len(self.currency) != 3
+            or not self.currency.isalpha()
+        ):
+            raise ValueError("CreditPack.currency must be a three-letter ISO code")
+        object.__setattr__(self, "currency", self.currency.lower())
 
 
 @dataclass
@@ -86,6 +98,25 @@ class GringottsConfig:
         cancel_url: Where Checkout returns on cancel; defaults to the buy page
             with ``?status=cancelled``.
         mount_path: URL prefix the routes mount under (default ``/gringotts``).
+        idempotency_enabled: Whether to install the response-caching idempotency
+            middleware so an ``Idempotency-Key`` header makes a request safe to
+            retry (default ``True``).
+        idempotency_header: The header carrying the idempotency key (default
+            ``"Idempotency-Key"``).
+        idempotency_max_key_length: Reject a key longer than this with ``400``
+            (default ``255``).
+        idempotency_max_body_bytes: A keyed request whose body exceeds this is
+            rejected with ``413`` before the app runs (default ``1_000_000``).
+        idempotency_max_response_bytes: A response larger than this is streamed to
+            the client but replays a marker rather than the body (default
+            ``1_000_000``).
+        idempotency_retention_seconds: A stored record older than this is treated
+            as expired — a reused key re-runs, bounding table growth and key
+            lifetime (default ``86_400``).
+        idempotency_replay_validator: Synchronous callback receiving the ASGI scope
+            before a host-application response is replayed. Return ``True`` only
+            after revalidating any mutable host authorization. Without one, host
+            retries stay safe but return ``409`` instead of cached response data.
     """
 
     packs: list[CreditPack] = field(default_factory=list)
@@ -94,6 +125,13 @@ class GringottsConfig:
     success_url: str | None = None
     cancel_url: str | None = None
     mount_path: str = "/gringotts"
+    idempotency_enabled: bool = True
+    idempotency_header: str = "Idempotency-Key"
+    idempotency_max_key_length: int = 255
+    idempotency_max_body_bytes: int = 1_000_000
+    idempotency_max_response_bytes: int = 1_000_000
+    idempotency_retention_seconds: float = 86_400.0
+    idempotency_replay_validator: Callable[[dict], bool] | None = None
 
     def __post_init__(self) -> None:
         """Fill Stripe credentials from env and require one currency across packs."""
@@ -103,8 +141,8 @@ class GringottsConfig:
         self.stripe_webhook_secret = self.stripe_webhook_secret or os.getenv(
             "STRIPE_WEBHOOK_SECRET"
         )
-        # Revenue is a single smallest-unit total, so mixed currencies would make
-        # it meaningless; require all packs to share one currency.
+        # A single Checkout page offers one currency; historical revenue remains
+        # grouped by the currency stored on each ledger row.
         currencies = {pack.currency.lower() for pack in self.packs}
         if len(currencies) > 1:
             raise ValueError(

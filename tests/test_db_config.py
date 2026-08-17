@@ -1,9 +1,18 @@
 """The shipped SQLite engine must wait on locks (busy_timeout) and use WAL,
 matching what the concurrency test relies on."""
 
+from importlib.metadata import version
+
+import starlette.testclient
 from sqlalchemy import text
 
 from gringotts.db import make_engine
+
+
+def test_fastapi_testclient_uses_supported_http_backend():
+    starlette_major = int(version("starlette").split(".", 1)[0])
+    expected = "httpx2" if starlette_major >= 1 else "httpx"
+    assert starlette.testclient.httpx.__name__ == expected
 
 
 def test_sqlite_engine_sets_busy_timeout_and_wal(tmp_path):

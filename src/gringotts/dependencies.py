@@ -68,11 +68,21 @@ def charge(cost: CostSpec) -> Callable[..., Iterator[User]]:
         try:
             user = authenticate(session, request.headers.get(API_KEY_HEADER))
             amount = cost(request) if callable(cost) else cost
+            if isinstance(amount, bool) or not isinstance(amount, int):
+                raise HTTPException(status_code=400, detail="Invalid credit cost")
             if amount < 0:
                 raise HTTPException(status_code=400, detail="Invalid credit cost")
             endpoint = request.url.path
             if not crud.charge_user(session, user, amount, endpoint=endpoint):
                 raise PaymentRequiredError(cost=amount, balance=user.credits)
+            scope = getattr(request, "scope", None)
+            if scope is not None:
+                # The debit is durable from this point onward. Idempotency must
+                # keep the key unless compensation is later confirmed, otherwise
+                # a failed refund followed by a retry can charge twice.
+                state = scope.setdefault("gringotts_idempotency", {})
+                state["charge_count"] = state.get("charge_count", 0) + 1
+                state["charged_credits"] = state.get("charged_credits", 0) + amount
             user_id = user.id
             try:
                 yield user
@@ -82,7 +92,15 @@ def charge(cost: CostSpec) -> Callable[..., Iterator[User]]:
                 # alone would let it consume credits for undelivered work).
                 # GeneratorExit is deliberately not caught: it fires on normal
                 # close and must not trigger a refund.
-                _refund_on_fresh_session(user_id, amount, endpoint)
+                refunded = _refund_on_fresh_session(user_id, amount, endpoint)
+                # Release the key only after compensation committed. A failed
+                # refund leaves the debit standing, so a retry must be blocked.
+                if refunded and scope is not None:
+                    state = scope.setdefault("gringotts_idempotency", {})
+                    state["refund_count"] = state.get("refund_count", 0) + 1
+                    state["refunded_credits"] = (
+                        state.get("refunded_credits", 0) + amount
+                    )
                 raise
         finally:
             session.close()
@@ -90,7 +108,7 @@ def charge(cost: CostSpec) -> Callable[..., Iterator[User]]:
     return dependency
 
 
-def _refund_on_fresh_session(user_id: int, amount: int, endpoint: str) -> None:
+def _refund_on_fresh_session(user_id: int, amount: int, endpoint: str) -> bool:
     """Compensate a charge on a brand-new session.
 
     Using a fresh session means a failing handler's uncommitted mutations to
@@ -100,10 +118,14 @@ def _refund_on_fresh_session(user_id: int, amount: int, endpoint: str) -> None:
     session = db.SessionLocal()
     try:
         user = crud.get_user(session, user_id)
-        if user is not None:
-            crud.refund_user(session, user, amount, endpoint=endpoint)
+        if user is None:
+            logger.error("gringotts: refund user %s no longer exists", user_id)
+            return False
+        crud.refund_user(session, user, amount, endpoint=endpoint)
+        return True
     except Exception:
         # Best-effort: never let a failed refund mask the original exception.
         logger.exception("gringotts: refund failed for user %s", user_id)
+        return False
     finally:
         session.close()

@@ -54,4 +54,3 @@ share gringotts' database session:
 - `gringotts.engine` — the SQLAlchemy ``Engine`` for that database (WAL and a
   busy timeout are applied automatically for SQLite).
 - `gringotts.Base` — the declarative base gringotts' models attach to.
-

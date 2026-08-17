@@ -4,6 +4,116 @@ All notable changes to this project are documented in this file. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+## [0.4.0] - 2026-08-17
+
+### Added
+
+- **Response-caching idempotency.** Send an `Idempotency-Key` header with any
+  mutating request (a `charge()`-guarded endpoint, the admin grant route, anything
+  the app serves) and a retry applies **exactly once**: the first request runs and
+  its response is stored; a later request with the same key from the same caller
+  gets that stored response back **without re-running the handler** — so the charge,
+  and any other side effect in the handler, happens once. Because the
+  replay short-circuits above the route, a retry can never double-charge, re-run the
+  handler for free, or race the original's refund.
+  - Keys are **scoped to the caller** (the API key), so one caller can't replay
+    another's key.
+  - Reusing a key for a materially different request (method, path, headers, or
+    body) returns `409 Conflict`; a replay carries an `Idempotent-Replayed: true`
+    header. Binding all headers prevents a changed authorization or pricing header
+    from replaying another operation's response.
+  - A raised error whose charge was **successfully refunded** releases the key, so
+    a genuine retry can re-attempt. A returned response—including a returned
+    `5xx`—is cached because its charge remains committed. If compensation fails,
+    the key stays locked rather than risking a second debit. A `4xx` (including a
+    `402` for insufficient credits) is cached; use a fresh key for a fresh attempt.
+  - Only **authenticated callers** create records (an invalid key can't fill the
+    table); an oversized request body is rejected with `413` and a response too
+    large to cache keeps the key locked with a marker; records **expire** after
+    `idempotency_retention_seconds`.
+  - A response marked `Cache-Control: no-store` is not persisted — so the admin
+    create-user route's one-time API key is never written to the response cache.
+  - An **in-flight or crashed** request is never auto-re-run — a duplicate or a
+    retry of an unknown outcome gets `409`, because age can't prove the first
+    attempt didn't already charge. A reused key expires lazily; to bound table
+    growth from keys that are never retried, schedule `gringotts prune-idempotency`
+    (e.g. a daily cron).
+  - Configurable via `GringottsConfig`: `idempotency_enabled` (default on),
+    `idempotency_header`, `idempotency_max_key_length`, `idempotency_max_body_bytes`,
+    `idempotency_max_response_bytes`, `idempotency_retention_seconds`, and
+    `idempotency_replay_validator`.
+  - Backed by a new `idempotency_records` table (applied by `gringotts migrate`).
+  - API-key validity and built-in admin authorization are checked before replay;
+    revoking either blocks the cached response. Known limitations (deliberate):
+    only the **charge** is guaranteed exactly-once, so any
+    *other* non-idempotent side effect a handler commits before raising is the
+    application's responsibility; and a crashed/disconnected in-flight request
+    leaks its lock (a `409` for retries, cleared by `prune-idempotency
+    --include-in-flight`).
+  - Built-in routes revalidate their complete authorization state before replay.
+    Host routes require an `idempotency_replay_validator` to revalidate mutable
+    application authorization; without one, the operation stays locked against
+    duplicate execution and the retry returns `409` rather than exposing cached
+    response data.
+- Curated documentation site: a grouped API reference, documented config fields,
+  usage examples, and new guides (Quickstart, How it works, Stripe & webhooks,
+  Examples).
+
+### Fixed
+
+- A failed compensating refund no longer releases an idempotency key and permits a
+  second debit; when a request has multiple charges, every debit must have an exact
+  confirmed refund before the request becomes retryable.
+- FastAPI 0.118.0 or newer is required so `charge()` can observe streaming and
+  background-task failures and compensate their debits before releasing a key.
+- SQLAlchemy 2.0.44 or newer is required for supported Python 3.13 and 3.14
+  runtimes; CI now executes the full suite against the runtime and test dependency
+  lower bounds.
+- Concurrent first attempts are serialized by the caller/key claim, and stale
+  requests cannot mutate a newer claim after emergency in-flight pruning and
+  primary-key reuse.
+- Handler-generated trailing-slash redirects retain and replay their key even when
+  no credit charge occurred; only FastAPI's pre-route automatic redirect releases
+  the claim for the redirected request.
+- Pruning an expired completed record concurrently with lazy key reclamation no
+  longer produces a spurious in-progress conflict.
+- Proportional Stripe clawbacks use exact integer rounding rather than floats, so
+  large credit balances cannot be over- or under-clawed through precision loss, and
+  dispute reinstatements preserve intervening refunds regardless of event order.
+- Incomplete immutable Stripe webhook snapshots now retrieve their current Checkout
+  Session, Refund, or Dispute before accounting instead of dropping a payment or
+  retrying an event whose contents cannot change.
+- Credit movements and pack prices reject fractional, string, and Boolean quantities
+  at runtime so SQLite, dynamic pricing, and Checkout configuration cannot admit
+  non-integers into the ledger or payment flow.
+- Paid Checkout, refund, and dispute events with incomplete settlement data return a
+  retryable error instead of granting or clawing credits from an unverifiable
+  event snapshot. When an immutable refund event omits its settlement status,
+  Gringotts retrieves the current Refund from Stripe instead of retrying that same
+  incomplete snapshot forever.
+- Stripe fulfillment is bound to a locally persisted Checkout order. A signed event
+  from another Checkout integration—or one whose user, credits, amount, or currency
+  differs from the authorized order—cannot mint credits.
+- Purchase and reversal rows store their ISO currency, and revenue is aggregated by
+  currency instead of silently adding incompatible minor units.
+
+### Removed
+
+- The legacy `gringotts.decorators.requires_credits` API was removed because a
+  decorator cannot observe failures that occur while streaming a response or
+  running a background task. Use `Depends(charge(cost))`, which compensates the
+  debit across the full response lifecycle.
+
+### Upgrading
+
+- Run `gringotts migrate` to create the `idempotency_records` and
+  `checkout_orders` tables and add the ledger currency column. Historical monetary
+  rows have unknown currency; new revenue is reported separately by ISO currency.
+- Drain Checkout Sessions created by 0.3.x before upgrading. Version 0.4.0 fulfills
+  only Sessions tied to a locally persisted `checkout_orders` row.
+
 ## [0.3.0] - 2026-08-15
 
 Correct money accounting: refunds and disputes now reverse the credits they

@@ -13,7 +13,9 @@ from gringotts.db import Base
 
 def make_app():
     app = FastAPI()
-    gringotts.init_app(app, GringottsConfig())
+    gringotts.init_app(
+        app, GringottsConfig(idempotency_replay_validator=lambda _scope: True)
+    )
 
     @app.get("/hello")
     def hello(user: CreditedUser = Depends(charge(2))):

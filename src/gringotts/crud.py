@@ -1,6 +1,7 @@
 """Database operations: users, atomic credit movements, and ledger queries."""
 
 import logging
+import secrets
 
 from sqlalchemy import case, func
 from sqlalchemy.exc import IntegrityError
@@ -9,6 +10,23 @@ from sqlalchemy.orm import Session
 from . import auth, models
 
 logger = logging.getLogger(__name__)
+
+
+def _require_integer_amount(amount: int) -> None:
+    """Reject values that cannot belong in the integer credit ledger."""
+    if isinstance(amount, bool) or not isinstance(amount, int):
+        raise TypeError("amount must be an integer")
+
+
+def _normalize_currency(currency: str | None) -> str | None:
+    """Validate and normalize a three-letter ISO currency code."""
+    if currency is None:
+        return None
+    if not isinstance(currency, str):
+        raise TypeError("currency must be a string")
+    if len(currency) != 3 or not currency.isalpha():
+        raise ValueError("currency must be a three-letter ISO code")
+    return currency.lower()
 
 
 def create_user(
@@ -20,6 +38,7 @@ def create_user(
     is_admin: bool = False,
 ) -> models.User:
     """Create a user, recording any initial credits as a grant ledger row."""
+    _require_integer_amount(credits)
     user = models.User(
         username=username,
         api_key_hash=api_key_hash,
@@ -58,15 +77,21 @@ def get_user_by_api_key(db: Session, api_key: str) -> models.User | None:
 
 
 def charge_user(
-    db: Session, user: models.User, cost: int, endpoint: str | None = None
+    db: Session,
+    user: models.User,
+    cost: int,
+    endpoint: str | None = None,
 ) -> bool:
-    """Atomically deduct `cost` if the balance suffices.
+    """Atomically deduct `cost` if the balance suffices; return whether it did.
 
-    The ledger row is written in the same transaction as the balance update.
-    Returns False (and leaves the balance untouched) when credits are short.
-    A `cost` of 0 is a no-op that succeeds without a ledger row; a negative
-    `cost` raises ValueError, since a charge must never raise a balance.
+    The ledger row is written in the same transaction as the balance update, via
+    a compare-and-set `UPDATE ... WHERE credits >= cost` so two concurrent charges
+    can't both pass a stale balance check. A `cost` of 0 is a no-op that returns
+    True and writes no row; a negative `cost` raises ValueError, since a charge
+    must never raise a balance. Safe retries are handled one layer up by
+    :class:`~gringotts.idempotency.IdempotencyMiddleware`, not here.
     """
+    _require_integer_amount(cost)
     if cost < 0:
         raise ValueError("charge cost cannot be negative")
     if cost == 0:
@@ -103,6 +128,7 @@ def refund_user(
     An `amount` of 0 is a no-op that writes no ledger row; a negative `amount`
     raises ValueError, since a refund must never deduct.
     """
+    _require_integer_amount(amount)
     if amount < 0:
         raise ValueError("refund amount cannot be negative")
     if amount == 0:
@@ -133,15 +159,19 @@ def grant_credits(
     external_id: str | None = None,
     amount_cents: int | None = None,
     payment_intent_id: str | None = None,
+    currency: str | None = None,
 ) -> bool:
     """Atomically add credits with a ledger row.
 
-    Returns False when `external_id` was already processed, making
-    event-driven crediting (e.g. Stripe webhooks) idempotent. A negative
-    `amount` raises ValueError, since a grant must never deduct.
+    Returns False when `external_id` was already processed, making event-driven
+    crediting (Stripe webhooks) idempotent. A negative `amount` raises ValueError,
+    since a grant must never deduct. HTTP-level safe-retry for the admin grant
+    route is handled by :class:`~gringotts.idempotency.IdempotencyMiddleware`.
     """
+    _require_integer_amount(amount)
     if amount < 0:
         raise ValueError("grant amount cannot be negative")
+    normalized_currency = _normalize_currency(currency)
     db.query(models.User).filter(models.User.id == user.id).update(
         {models.User.credits: models.User.credits + amount}
     )
@@ -154,6 +184,7 @@ def grant_credits(
             external_id=external_id,
             amount_cents=amount_cents,
             payment_intent_id=payment_intent_id,
+            currency=normalized_currency,
             balance_after=user.credits,
         )
     )
@@ -161,14 +192,81 @@ def grant_credits(
         db.commit()
     except IntegrityError:
         db.rollback()
-        # Only a duplicate external_id means "already processed" (idempotent
-        # replay). Any other integrity failure is a real error we must not
-        # swallow, or a valid grant would vanish silently.
+        # A duplicate external_id means "already processed" (idempotent replay).
+        # Any other integrity failure is a real error we must not swallow, or a
+        # valid grant would vanish silently.
         if external_id is not None and external_id_exists(db, external_id):
             return False
         raise
     db.refresh(user)
     return True
+
+
+def create_checkout_order(
+    db: Session,
+    user: models.User,
+    credits: int,
+    amount_cents: int,
+    currency: str,
+) -> models.CheckoutOrder:
+    """Persist the exact entitlement authorized before creating Stripe Checkout."""
+    _require_integer_amount(credits)
+    _require_integer_amount(amount_cents)
+    if credits <= 0 or amount_cents < 0:
+        raise ValueError("invalid Checkout order amounts")
+    normalized_currency = _normalize_currency(currency)
+    if normalized_currency is None:
+        raise ValueError("Checkout order currency is required")
+    order = models.CheckoutOrder(
+        id=secrets.token_hex(16),
+        user_id=user.id,
+        credits=credits,
+        amount_cents=amount_cents,
+        currency=normalized_currency,
+    )
+    db.add(order)
+    db.commit()
+    db.refresh(order)
+    return order
+
+
+def bind_checkout_order(
+    db: Session,
+    order_id: str,
+    stripe_session_id: str,
+    *,
+    commit: bool,
+) -> models.CheckoutOrder | None:
+    """Atomically bind an order once to its Stripe Checkout Session."""
+    updated = (
+        db.query(models.CheckoutOrder)
+        .filter(
+            models.CheckoutOrder.id == order_id,
+            (models.CheckoutOrder.stripe_session_id.is_(None))
+            | (models.CheckoutOrder.stripe_session_id == stripe_session_id),
+        )
+        .update(
+            {models.CheckoutOrder.stripe_session_id: stripe_session_id},
+            synchronize_session=False,
+        )
+    )
+    if not updated:
+        existing = db.get(models.CheckoutOrder, order_id)
+        if existing is None:
+            return None
+        raise ValueError("Checkout order is already bound to another Session")
+    order = db.get(models.CheckoutOrder, order_id)
+    assert order is not None  # noqa: S101 - the successful UPDATE proves it exists
+    db.refresh(order)
+    if commit:
+        db.commit()
+        db.refresh(order)
+    return order
+
+
+def get_checkout_order(db: Session, order_id: str) -> models.CheckoutOrder | None:
+    """Return a locally authorized Checkout order, or None."""
+    return db.get(models.CheckoutOrder, order_id)
 
 
 def external_id_exists(db: Session, external_id: str) -> bool:
@@ -221,16 +319,6 @@ def lock_user(db: Session, user_id: int) -> models.User | None:
     return db.get(models.User, user_id)
 
 
-def clawback_deducted(db: Session, external_id: str) -> int:
-    """The credits a prior clawback row actually deducted (absolute value)."""
-    row = (
-        db.query(models.CreditTransaction.amount)
-        .filter(models.CreditTransaction.external_id == external_id)
-        .first()
-    )
-    return -int(row[0]) if row is not None else 0
-
-
 def clawback_totals(db: Session, payment_intent_id: str) -> tuple[int, int]:
     """Cumulative (reversed cents, credits clawed) for a purchase's clawbacks.
 
@@ -264,6 +352,7 @@ def clawback_credits(
     endpoint: str | None = None,
     amount_cents: int | None = None,
     payment_intent_id: str | None = None,
+    currency: str | None = None,
 ) -> int:
     """Deduct up to `amount` credits (clamped at zero) with a ledger row.
 
@@ -274,8 +363,10 @@ def clawback_credits(
     `amount_cents` records the reversed money and `payment_intent_id` ties the row
     to its purchase, so cumulative clawback math stays exact across partials.
     """
+    _require_integer_amount(amount)
     if amount < 0:
         raise ValueError("clawback amount cannot be negative")
+    normalized_currency = _normalize_currency(currency)
     # Lock the user row so the clamp reads a stable balance (Postgres); SQLite
     # serializes writers, so the read-decide-write is atomic there too.
     current = (
@@ -299,6 +390,7 @@ def clawback_credits(
             endpoint=endpoint,
             amount_cents=amount_cents,
             payment_intent_id=payment_intent_id,
+            currency=normalized_currency,
             balance_after=user.credits,
         )
     )
@@ -387,7 +479,7 @@ def list_users_with_stats(db: Session) -> list[dict]:
 
 
 def aggregate_stats(db: Session) -> dict:
-    """Return system totals: users, credits outstanding/consumed/purchased, revenue."""
+    """Return system totals, keeping revenue separated by ISO currency."""
     user_count = db.query(func.count(models.User.id)).scalar() or 0
     outstanding = db.query(func.sum(models.User.credits)).scalar() or 0
 
@@ -408,15 +500,26 @@ def aggregate_stats(db: Session) -> dict:
         + _sum_for("clawback", models.CreditTransaction.amount)
         + _sum_for("reinstate", models.CreditTransaction.amount)
     )
-    # revenue = money paid minus money reversed. clawback rows carry the reversed
-    # cents (positive), reinstate rows the negative offset, so subtracting both
-    # nets a refunded/disputed payment out of revenue.
-    reversed_cents = _sum_for(
-        "clawback", models.CreditTransaction.amount_cents
-    ) + _sum_for("reinstate", models.CreditTransaction.amount_cents)
-    revenue_cents = (
-        _sum_for("purchase", models.CreditTransaction.amount_cents) - reversed_cents
+    money_rows = (
+        db.query(
+            models.CreditTransaction.currency,
+            models.CreditTransaction.kind,
+            func.sum(models.CreditTransaction.amount_cents),
+        )
+        .filter(
+            models.CreditTransaction.kind.in_(("purchase", "clawback", "reinstate")),
+            models.CreditTransaction.amount_cents.is_not(None),
+        )
+        .group_by(models.CreditTransaction.currency, models.CreditTransaction.kind)
+        .all()
     )
+    revenue: dict[str, int] = {}
+    for currency, kind, total in money_rows:
+        key = currency or "unknown"
+        # Purchases add money. Clawbacks carry positive reversed minor units and
+        # reinstatements carry the negative offset, so both are subtracted.
+        delta = int(total or 0) if kind == "purchase" else -int(total or 0)
+        revenue[key] = revenue.get(key, 0) + delta
     return {
         "users": int(user_count),
         "credits_outstanding": int(outstanding),
@@ -424,7 +527,7 @@ def aggregate_stats(db: Session) -> dict:
         "credits_consumed": charged - refunded,
         # net of clawbacks: a refunded/disputed purchase nets back out
         "credits_purchased": purchased,
-        "revenue_cents": revenue_cents,
+        "revenue_by_currency": dict(sorted(revenue.items())),
     }
 
 
@@ -468,6 +571,32 @@ def find_balance_discrepancies(db: Session) -> list[dict]:
                 }
             )
     return discrepancies
+
+
+def purge_idempotency_records(
+    db: Session, older_than_seconds: float, include_in_flight: bool = False
+) -> int:
+    """Delete idempotency records older than `older_than_seconds`; return the count.
+
+    Response caching stores a row per keyed request; this reclaims space from keys
+    that are never retried (the middleware also expires records lazily on reuse).
+    Only **completed** records are removed by default: an in-flight (`completed=
+    False`) row is a live lock, and deleting it could free a key whose request is
+    still running, letting a retry execute the side effect again. Pass
+    `include_in_flight=True` only to clear locks left by crashed requests, when you
+    know none are genuinely still running.
+    """
+    from datetime import UTC, datetime, timedelta
+
+    cutoff = datetime.now(UTC) - timedelta(seconds=older_than_seconds)
+    query = db.query(models.IdempotencyRecord).filter(
+        models.IdempotencyRecord.created_at < cutoff
+    )
+    if not include_in_flight:
+        query = query.filter(models.IdempotencyRecord.completed.is_(True))
+    deleted = query.delete(synchronize_session=False)
+    db.commit()
+    return int(deleted)
 
 
 def set_admin(db: Session, user: models.User, is_admin: bool) -> models.User:

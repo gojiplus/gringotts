@@ -35,6 +35,47 @@ with SessionLocal() as db:
     grant(db, user, 100, kind="promo", external_id="signup-bonus-42")
 ```
 
+## Idempotent requests
+
+Pass an `Idempotency-Key` header and a retried request applies **exactly once**:
+the first request runs and its response is stored; the retry returns that stored
+response without re-running the handler — so the charge happens once and the retry
+gets the original result back (with an `Idempotent-Replayed: true` header):
+
+For host routes, configure a synchronous validator that rechecks mutable
+authorization before cached data is returned. If `X-API-Key` is the only such
+state, Gringotts already validates it and the callback can allow replay:
+
+```python
+gringotts.init_app(
+    app,
+    GringottsConfig(idempotency_replay_validator=lambda _scope: True),
+)
+```
+
+Without a validator, the first operation still runs once and remains locked, but
+a retry returns `409` instead of bypassing host authorization to expose cached
+data. Built-in Gringotts routes revalidate their own authorization and need no
+callback.
+
+```bash
+# both calls together charge once; the second returns the first's response
+curl -X POST localhost:8000/predict \
+  -H "X-API-Key: gk_..." -H "Idempotency-Key: order-42"
+curl -X POST localhost:8000/predict \
+  -H "X-API-Key: gk_..." -H "Idempotency-Key: order-42"
+```
+
+Keys are scoped to the caller, so one caller can't replay another's key. Reusing a
+key for a materially different request (method, path, any header, or body) returns
+`409`. This includes authorization and dynamic-pricing headers, preventing a replay
+from crossing application principals or operation inputs. A
+raised error whose debit was refunded releases the key, so a genuine retry can
+re-attempt. A handler that returns a `5xx` leaves its debit committed, so that
+response is cached. Responses marked `no-store` or too large to retain replay a
+marker instead of their original body. The same protection covers the admin grant
+route and every other mutating endpoint your app serves.
+
 ## Admin API
 
 Any user with the admin flag can manage users and credits over HTTP (JSON for

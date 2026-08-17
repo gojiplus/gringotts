@@ -12,7 +12,7 @@ from gringotts import models  # noqa: F401  (registers tables on Base)
 @pytest.fixture
 def db_session(monkeypatch):
     """Fresh database per test; gringotts.db.SessionLocal is patched so the
-    library (dependencies, decorators, CLI) uses it too.
+    library (dependencies and CLI) uses it too.
 
     Set GRINGOTTS_TEST_DATABASE_URL (e.g. a Postgres URL in CI) to run the
     suite against a real server instead of in-memory SQLite."""

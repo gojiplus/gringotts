@@ -23,7 +23,11 @@ app = FastAPI()
 
 gringotts.init_app(
     app,
-    GringottsConfig(packs=[CreditPack(credits=100, price_cents=500, name="Starter")]),
+    GringottsConfig(
+        packs=[CreditPack(credits=100, price_cents=500, name="Starter")],
+        # X-API-Key is this example app's only mutable authorization state.
+        idempotency_replay_validator=lambda _scope: True,
+    ),
 )
 
 
@@ -42,9 +46,10 @@ your purchase page; Stripe Checkout tops them up.
   network calls, no rev share, no vendor that can shut down under you.
 - **Correct where it's hard to be**: atomic credit deduction (no overspend under
   concurrency), automatic refund when your handler raises, idempotent webhook
-  crediting, refund/dispute clawback (clamped so a balance never goes negative),
-  and an append-only ledger — with a per-row running balance — auditing every
-  credit movement.
+  crediting, optional `Idempotency-Key` so retried charges/grants apply once,
+  refund/dispute clawback (clamped so a balance never goes negative), and an
+  append-only ledger — with a per-row running balance — auditing every credit
+  movement.
 - **Agent-ready 402**: the insufficient-credits response is typed JSON
   (x402-compatible vocabulary), so AI-agent clients can parse it and pay.
 
@@ -185,7 +190,7 @@ Payments Protocol) can be added later without breaking the shape.
 
 ## How it stores things
 
-Two tables, created by `gringotts init-db`:
+Four tables, created by `gringotts init-db`:
 
 - `users` — username, SHA-256 hash of the API key (the key itself is shown
   once and never stored), last 4 characters for display, current balance. A
@@ -199,6 +204,16 @@ Two tables, created by `gringotts init-db`:
   carry the Stripe checkout session id under a unique constraint — that's what
   makes webhook crediting idempotent, even when Stripe sends more than one event
   for the same session.
+  Monetary rows also store their ISO currency, so revenue is never summed across
+  incompatible minor units.
+- `idempotency_records` — one response-cache row per caller and
+  `Idempotency-Key`. The unique caller/key index elects one request to run; a
+  concurrent duplicate gets `409`, and a later retry replays the stored result
+  without running or charging again. Method, path, query, every request header,
+  and body are fingerprinted, so changed authorization or pricing inputs conflict.
+- `checkout_orders` — the locally authorized user, credits, price, and currency
+  for each Stripe Checkout. A paid webhook grants only when the Stripe Session
+  matches this row exactly.
 
 Works on SQLite out of the box and Postgres via
 `DATABASE_URL=postgresql://...` (both run in CI, including a parallel-writer
@@ -216,6 +231,7 @@ concurrent writers wait rather than erroring with "database is locked."
 | `packs` | `GringottsConfig(packs=[CreditPack(...)])` | `[]` |
 | `success_url` / `cancel_url` | `GringottsConfig` | back to the purchase page |
 | `mount_path` | `GringottsConfig` | `/gringotts` |
+| `idempotency_replay_validator` | `GringottsConfig` | `None` (host retries stay locked and return `409`) |
 
 ## CLI
 
@@ -232,11 +248,11 @@ gringotts migrate                  # apply pending schema changes to an existing
 
 Upgrading an existing database is `gringotts migrate` (not a recreate): it
 applies forward-only, idempotent schema changes in place, and refuses to run if
-the ledger doesn't already reconcile. Upgrading from 0.1.x: webhook idempotency
-now keys on the checkout-session id rather than the Stripe event id, so **drain
-any in-flight delayed (ACH) payments before upgrading** — a settlement arriving
-afterward can't be matched to a 0.1-era purchase row and could be credited twice
-(`gringotts migrate` warns when it finds such rows).
+the ledger doesn't already reconcile. Before upgrading from 0.3.x to 0.4.0,
+drain in-flight Checkout Sessions; 0.4.0 fulfills only Sessions backed by its new
+local `checkout_orders` row. Upgrading from 0.1.x also requires draining delayed
+payments because those purchases were keyed on the Stripe event id rather than
+the Checkout Session id (`gringotts migrate` warns when it finds such rows).
 
 ## Not yet (deliberately)
 
