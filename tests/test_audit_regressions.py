@@ -4,6 +4,7 @@ Each test fails if its fix is reverted. They assert the *fixed* behavior;
 the docstring names the finding and the failure the fix prevents.
 """
 
+import importlib.util
 import json
 
 import pytest
@@ -23,6 +24,11 @@ from gringotts import (
     crud,
     models,
 )
+
+
+def test_unsafe_legacy_decorator_is_unavailable():
+    """Prevent reintroducing a charge path that cannot observe response failures."""
+    assert importlib.util.find_spec("gringotts.decorators") is None
 
 
 def ledger_sum(db, user_id):

@@ -6,7 +6,7 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-## [0.4.0] - 2026-08-16
+## [0.4.0] - 2026-08-17
 
 ### Added
 
@@ -86,6 +86,13 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   event snapshot. When an immutable refund event omits its settlement status,
   Gringotts retrieves the current Refund from Stripe instead of retrying that same
   incomplete snapshot forever.
+
+### Removed
+
+- The legacy `gringotts.decorators.requires_credits` API was removed because a
+  decorator cannot observe failures that occur while streaming a response or
+  running a background task. Use `Depends(charge(cost))`, which compensates the
+  debit across the full response lifecycle.
 
 ### Upgrading
 
