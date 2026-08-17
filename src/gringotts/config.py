@@ -94,9 +94,10 @@ class GringottsConfig:
         idempotency_max_key_length: Reject a key longer than this with ``400``
             (default ``255``).
         idempotency_max_body_bytes: A keyed request whose body exceeds this is
-            passed through uncached rather than buffered (default ``1_000_000``).
+            rejected with ``413`` before the app runs (default ``1_000_000``).
         idempotency_max_response_bytes: A response larger than this is streamed to
-            the client but not cached (default ``1_000_000``).
+            the client but replays a marker rather than the body (default
+            ``1_000_000``).
         idempotency_retention_seconds: A stored record older than this is treated
             as expired — a reused key re-runs, bounding both table growth and how
             long a replay can outlive a revoked credential (default ``86_400``).

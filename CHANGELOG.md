@@ -4,6 +4,8 @@ All notable changes to this project are documented in this file. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
 ## [0.4.0] - 2026-08-16
 
 ### Added
@@ -12,17 +14,19 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   mutating request (a `charge()`-guarded endpoint, the admin grant route, anything
   the app serves) and a retry applies **exactly once**: the first request runs and
   its response is stored; a later request with the same key from the same caller
-  gets that stored response back **verbatim, without re-running the handler** — so
-  the charge, and any other side effect in the handler, happens once. Because the
+  gets that stored response back **without re-running the handler** — so the charge,
+  and any other side effect in the handler, happens once. Because the
   replay short-circuits above the route, a retry can never double-charge, re-run the
   handler for free, or race the original's refund.
   - Keys are **scoped to the caller** (the API key), so one caller can't replay
     another's key.
   - Reusing a key for a materially different request (method, path, or body) returns
     `409 Conflict`; a replay carries an `Idempotent-Replayed: true` header.
-  - A **5xx or unhandled error is not cached** — it's transient, so the key is
-    released and a genuine retry re-attempts. A `4xx` (including a `402` for
-    insufficient credits) *is* cached; use a fresh key for a fresh attempt.
+  - A raised error whose charge was **successfully refunded** releases the key, so
+    a genuine retry can re-attempt. A returned response—including a returned
+    `5xx`—is cached because its charge remains committed. If compensation fails,
+    the key stays locked rather than risking a second debit. A `4xx` (including a
+    `402` for insufficient credits) is cached; use a fresh key for a fresh attempt.
   - Only **authenticated callers** create records (an invalid key can't fill the
     table); an oversized request body is rejected with `413` and a response too
     large to cache keeps the key locked with a marker; records **expire** after
@@ -49,6 +53,19 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Curated documentation site: a grouped API reference, documented config fields,
   usage examples, and new guides (Quickstart, How it works, Stripe & webhooks,
   Examples).
+
+### Fixed
+
+- A failed compensating refund no longer releases an idempotency key and permits a
+  second debit; only a confirmed refund makes the request retryable.
+- Concurrent first attempts are serialized by the caller/key claim, and stale
+  requests cannot mutate a newer claim after emergency in-flight pruning and
+  primary-key reuse.
+- Proportional Stripe clawbacks use exact integer rounding rather than floats, so
+  large credit balances cannot be over- or under-clawed through precision loss.
+- Paid Checkout, refund, and dispute events with incomplete settlement data return a
+  retryable error instead of granting or clawing credits from an unverifiable
+  event snapshot.
 
 ### Upgrading
 

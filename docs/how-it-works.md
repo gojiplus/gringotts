@@ -5,7 +5,7 @@ invariants it never breaks.
 
 ## The ledger and the balance
 
-Two tables hold everything:
+Three tables hold everything:
 
 - **`users`** — one row per API consumer: the SHA-256 hash of their key (the key
   itself is shown once and never stored), the last four characters for display,
@@ -14,6 +14,8 @@ Two tables hold everything:
   purchase, clawback, and reinstatement is one signed row (`amount` is negative
   for charges and clawbacks, positive otherwise), written **in the same database
   transaction** as the balance update.
+- **`idempotency_records`** — the response cache and lock for keyed requests,
+  uniquely indexed by caller and `Idempotency-Key`.
 
 So the cached `credits` is a fast read, but the ledger is the source of truth:
 the sum of a user's `amount` values always equals their balance.

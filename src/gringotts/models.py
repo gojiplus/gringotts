@@ -80,11 +80,12 @@ class IdempotencyRecord(Base):
 
     An ``Idempotency-Key`` header makes a mutating request safe to retry: the
     first request runs and its response is captured here; any later request with
-    the same key from the same caller returns this stored response verbatim
-    without re-running the handler — so a retried charge or grant applies exactly
-    once. Scoped by ``api_key_hash`` (the caller), so one caller can never replay
-    another's key. ``request_fingerprint`` guards against reusing a key for a
-    materially different request (method, path, or body), which returns a 409.
+    the same key from the same caller returns the stored response (or a marker for
+    a non-cacheable body) without re-running the handler — so a retried charge or
+    grant applies exactly once. Scoped by ``api_key_hash`` (the caller), so one
+    caller can never replay another's key. ``request_fingerprint`` guards against
+    reusing a key for a materially different request (method, path, or body),
+    which returns a 409.
     """
 
     __tablename__ = "idempotency_records"
@@ -111,7 +112,7 @@ class IdempotencyRecord(Base):
     status_code: Mapped[int | None] = mapped_column(default=None)
     response_body: Mapped[bytes | None] = mapped_column(LargeBinary, default=None)
     # the captured response headers, JSON list of [name, value] latin-1 strings,
-    # so a replay reproduces Location / Set-Cookie / HX-Trigger etc. verbatim
+    # so an ordinary replay reproduces Location / Set-Cookie / HX-Trigger, etc.
     response_headers: Mapped[str | None] = mapped_column(String, default=None)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(UTC)

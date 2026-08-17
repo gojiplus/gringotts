@@ -7,14 +7,20 @@ without re-running the handler.
 """
 
 import asyncio
+import os
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 
 from fastapi import Depends, FastAPI, Response
 from fastapi.testclient import TestClient
+from sqlalchemy.orm import sessionmaker
 from test_charge import make_app
 
 import gringotts
 from gringotts import CreditedUser, GringottsConfig, auth, charge, crud, models
+from gringotts import db as gdb
+from gringotts.db import Base, make_engine
 from gringotts.idempotency import IdempotencyMiddleware, _fingerprint
 
 
@@ -212,6 +218,68 @@ def test_in_progress_request_conflicts(db_session):
     assert r.status_code == 409
     db_session.refresh(user)
     assert user.credits == 10  # not charged while the first is in flight
+
+
+def test_concurrent_first_attempts_run_handler_once(tmp_path, monkeypatch):
+    url = os.getenv("GRINGOTTS_TEST_DATABASE_URL") or (
+        f"sqlite:///{tmp_path}/idempotency-race.db"
+    )
+    engine = make_engine(url)
+    session_local = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    Base.metadata.drop_all(bind=engine)
+    Base.metadata.create_all(bind=engine)
+    monkeypatch.setattr(gdb, "SessionLocal", session_local)
+
+    with session_local() as setup:
+        user, key = auth.create_user_with_key(setup, "race", credits=10)
+        user_id = user.id
+
+    app = FastAPI()
+    gringotts.init_app(app, GringottsConfig())
+    calls = 0
+    calls_lock = threading.Lock()
+
+    @app.get("/once")
+    def once(user: CreditedUser = Depends(charge(2))):
+        nonlocal calls
+        with calls_lock:
+            calls += 1
+        return {"credits": user.credits}
+
+    # Make both requests finish caller validation before either can claim the
+    # unique (caller, key) row. This exercises the actual insert race rather than
+    # merely sending a duplicate after the first request is already in flight.
+    barrier = threading.Barrier(2)
+    original = IdempotencyMiddleware._caller_exists
+
+    def caller_exists_together(self, api_key):
+        exists = original(self, api_key)
+        barrier.wait(timeout=10)
+        return exists
+
+    monkeypatch.setattr(IdempotencyMiddleware, "_caller_exists", caller_exists_together)
+    headers = {"X-API-Key": key, "Idempotency-Key": "same-first-attempt"}
+
+    def request_once(_):
+        return TestClient(app).get("/once", headers=headers)
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            responses = list(pool.map(request_once, range(2)))
+        assert {response.status_code for response in responses} <= {200, 409}
+        assert any(response.status_code == 200 for response in responses)
+        assert calls == 1
+        with session_local() as check:
+            assert crud.get_user(check, user_id).credits == 8
+            assert (
+                check.query(models.CreditTransaction)
+                .filter_by(user_id=user_id, kind="charge")
+                .count()
+                == 1
+            )
+            assert crud.find_balance_discrepancies(check) == []
+    finally:
+        engine.dispose()
 
 
 def test_in_progress_is_never_reclaimed_by_age(db_session):
@@ -417,33 +485,31 @@ def test_read_body_flags_overflow():
     assert body == b""  # oversized body isn't buffered — the request is rejected
 
 
-def test_background_task_failure_keeps_lock(db_session):
-    # a handler returns 200 (charge committed, response sent) then its background
-    # task raises; the middleware must NOT release the key, or a retry re-charges
+def test_background_task_failure_refunds_and_does_not_double_charge(db_session):
+    # a handler returns 200 then its background task raises; charge() refunds, so
+    # the middleware must NOT cache the (paid) 200 — that would hand a retry the
+    # success output for free — and must never double-charge.
     from fastapi.responses import JSONResponse
     from starlette.background import BackgroundTask
 
     app = FastAPI()
     gringotts.init_app(app, GringottsConfig())
-    ran = {"n": 0}
 
     def boom():
         raise RuntimeError("background failure")
 
     @app.get("/bg")
     def bg(user: CreditedUser = Depends(charge(2))):
-        ran["n"] += 1
         return JSONResponse({"ok": True}, background=BackgroundTask(boom))
 
-    _, key = auth.create_user_with_key(db_session, "bgk", credits=10)
+    user, key = auth.create_user_with_key(db_session, "bgk", credits=10)
     client = TestClient(app, raise_server_exceptions=False)
     h = {"X-API-Key": key, "Idempotency-Key": "bgk1"}
-    client.get("/bg", headers=h)  # 200 returned, then background task raises
-    client.get("/bg", headers=h)  # must replay, not re-run the handler
-    # The response already started, so the key is kept (cached) rather than
-    # released: the retry replays instead of re-running. With the old
-    # delete-on-any-exception this ran twice (a double execution).
-    assert ran["n"] == 1
+    client.get("/bg", headers=h)  # 200 returned, bg raises -> charge refunded
+    client.get("/bg", headers=h)  # key released -> re-runs, refunds again
+    db_session.refresh(user)
+    assert user.credits == 10  # refunded each time; never double-charged
+    assert crud.find_balance_discrepancies(db_session) == []
 
 
 def test_streaming_response_is_cached_without_hang(db_session):
@@ -502,9 +568,10 @@ def test_no_store_response_body_is_not_persisted(db_session):
     assert r2.headers.get("idempotent-response-not-cached") == "true"
 
 
-def test_interrupted_stream_is_not_replayed_as_complete(db_session):
-    # a streaming handler that raises mid-stream must not have its partial body
-    # replayed as if complete
+def test_interrupted_stream_refunds_and_releases_key(db_session):
+    # a streaming handler that raises mid-stream is refunded by charge(); the key
+    # is released (the partial body is never cached as a complete response) and no
+    # double-charge can occur
     from fastapi.responses import StreamingResponse
 
     app = FastAPI()
@@ -518,16 +585,20 @@ def test_interrupted_stream_is_not_replayed_as_complete(db_session):
 
         return StreamingResponse(gen(), media_type="text/plain")
 
-    _, key = auth.create_user_with_key(db_session, "ps", credits=10)
+    user, key = auth.create_user_with_key(db_session, "ps", credits=10)
     client = TestClient(app, raise_server_exceptions=False)
     h = {"X-API-Key": key, "Idempotency-Key": "pk"}
-    client.get("/partial", headers=h)  # started, then raised mid-stream
-    rec = (
-        db_session.query(models.IdempotencyRecord).filter_by(idempotency_key="pk").one()
+    client.get("/partial", headers=h)  # started, then raised mid-stream -> refunded
+    # refunded -> key released, no partial body cached as a complete response
+    assert (
+        db_session.query(models.IdempotencyRecord)
+        .filter_by(idempotency_key="pk")
+        .count()
+        == 0
     )
-    # stored as a marker (not the partial "first" bytes), key kept locked
-    assert b"first" not in (rec.response_body or b"")
-    assert rec.completed is True
+    db_session.refresh(user)
+    assert user.credits == 10  # refunded; not charged for the broken stream
+    assert crud.find_balance_discrepancies(db_session) == []
 
 
 def test_prune_retains_in_flight_by_default(db_session):
@@ -607,6 +678,90 @@ def test_slash_redirect_does_not_conflict(db_session):
     assert r.json() == {"ok": True}
     db_session.refresh(user)
     assert user.credits == 8  # charged once at /x/
+
+
+def test_endpoint_slash_redirect_after_charge_is_cached(db_session):
+    # an endpoint that CHARGES then itself returns a 307 to its own path+slash must
+    # NOT be mistaken for a router redirect and released — that would double-charge
+    from fastapi.responses import RedirectResponse
+
+    app = FastAPI()
+    gringotts.init_app(app, GringottsConfig())
+
+    @app.get("/y")
+    def y(user: CreditedUser = Depends(charge(2))):
+        return RedirectResponse("/y/", status_code=307)
+
+    user, key = auth.create_user_with_key(db_session, "yy", credits=10)
+    client = TestClient(app)
+    h = {"X-API-Key": key, "Idempotency-Key": "yk"}
+    r1 = client.get("/y", headers=h, follow_redirects=False)
+    assert r1.status_code == 307
+    rec = (
+        db_session.query(models.IdempotencyRecord).filter_by(idempotency_key="yk").one()
+    )
+    assert rec.completed is True  # committed charge -> cached, not released
+    r2 = client.get("/y", headers=h, follow_redirects=False)
+    assert r2.headers.get("idempotent-replayed") == "true"
+    db_session.refresh(user)
+    assert user.credits == 8  # charged once
+
+
+def test_refund_failure_keeps_key_locked(db_session, monkeypatch):
+    # if compensation itself fails, the charge still stands, so the key must NOT be
+    # released — a retry would otherwise charge again on top of the un-refunded debit
+    app = FastAPI()
+    gringotts.init_app(app, GringottsConfig())
+
+    @app.get("/rf")
+    def rf(user: CreditedUser = Depends(charge(2))):
+        raise RuntimeError("handler failure")
+
+    user, key = auth.create_user_with_key(db_session, "rf", credits=10)
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("refund failure")
+
+    monkeypatch.setattr(crud, "refund_user", _boom)
+    client = TestClient(app, raise_server_exceptions=False)
+    h = {"X-API-Key": key, "Idempotency-Key": "rfk"}
+    client.get("/rf", headers=h)  # charged, handler fails, refund FAILS
+    client.get("/rf", headers=h)  # key not released -> not re-charged
+    db_session.refresh(user)
+    assert user.credits == 8  # the un-refunded charge stands once, never doubled
+
+
+def test_old_request_cannot_mutate_reused_record_id(db_session):
+    middleware = IdempotencyMiddleware(None)
+    outcome, old_claim, _ = middleware._claim("caller-a", "old", "fingerprint-a")
+    assert outcome == "new"
+    assert old_claim is not None
+    old_id, _ = old_claim
+
+    # Simulate the documented emergency cleanup while the original request still
+    # exists, then force a new owner to reuse the integer primary key.
+    crud.purge_idempotency_records(
+        db_session, older_than_seconds=-1, include_in_flight=True
+    )
+    replacement = models.IdempotencyRecord(
+        id=old_id,
+        api_key_hash="caller-b",
+        idempotency_key="new",
+        request_fingerprint="fingerprint-b",
+        completed=False,
+        created_at=datetime.now(UTC) + timedelta(seconds=1),
+    )
+    db_session.add(replacement)
+    db_session.commit()
+
+    middleware._delete(old_claim)
+    middleware._store(old_claim, 200, b"old", "[]")
+    db_session.expire_all()
+    current = db_session.get(models.IdempotencyRecord, old_id)
+    assert current is not None
+    assert current.api_key_hash == "caller-b"
+    assert current.completed is False
+    assert current.response_body is None
 
 
 def test_fingerprint_no_collision_with_null_bytes():

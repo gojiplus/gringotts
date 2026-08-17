@@ -39,9 +39,8 @@ with SessionLocal() as db:
 
 Pass an `Idempotency-Key` header and a retried request applies **exactly once**:
 the first request runs and its response is stored; the retry returns that stored
-response verbatim, without re-running the handler — so the charge happens once and
-the retry even gets the original result back (with an `Idempotent-Replayed: true`
-header):
+response without re-running the handler — so the charge happens once and the retry
+gets the original result back (with an `Idempotent-Replayed: true` header):
 
 ```bash
 # both calls together charge once; the second returns the first's response
@@ -53,8 +52,11 @@ curl -X POST localhost:8000/predict \
 
 Keys are scoped to the caller, so one caller can't replay another's key. Reusing a
 key for a materially different request (method, path, or body) returns `409`. A
-server error (5xx) isn't cached, so a genuine retry re-attempts. The same caching
-covers the admin grant route and every other mutating endpoint your app serves.
+raised error whose debit was refunded releases the key, so a genuine retry can
+re-attempt. A handler that returns a `5xx` leaves its debit committed, so that
+response is cached. Responses marked `no-store` or too large to retain replay a
+marker instead of their original body. The same protection covers the admin grant
+route and every other mutating endpoint your app serves.
 
 ## Admin API
 

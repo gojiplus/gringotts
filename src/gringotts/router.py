@@ -33,6 +33,30 @@ _DISPUTE_WITHDRAWN = "charge.dispute.funds_withdrawn"
 _DISPUTE_REINSTATED = "charge.dispute.funds_reinstated"
 
 
+def _round_proportional(value: int, numerator: int, denominator: int) -> int:
+    """Return ``round(value * numerator / denominator)`` using exact integers."""
+    if value < 0 or numerator < 0 or denominator <= 0:
+        raise ValueError("proportional rounding requires non-negative values")
+    quotient, remainder = divmod(value * numerator, denominator)
+    twice_remainder = remainder * 2
+    if twice_remainder > denominator or (
+        twice_remainder == denominator and quotient % 2
+    ):
+        quotient += 1
+    return quotient
+
+
+def _expandable_id(value) -> str | None:
+    """Normalize a Stripe expandable ID represented as a string or object."""
+    if isinstance(value, str):
+        return value or None
+    try:
+        id_ = value["id"]
+    except (KeyError, TypeError):
+        return None
+    return id_ if isinstance(id_, str) and id_ else None
+
+
 def _apply_reversal(
     db, event, *, payment_intent, reversed_cents, external_id, endpoint
 ):
@@ -75,7 +99,7 @@ def _apply_reversal(
     granted, paid = purchase.amount, purchase.amount_cents
     prior_cents, prior_clawed = crud.clawback_totals(db, payment_intent)
     capped_cents = min(prior_cents + reversed_cents, paid)
-    target = round(granted * capped_cents / paid)
+    target = _round_proportional(granted, capped_cents, paid)
     delta = max(0, target - prior_clawed)
     crud.clawback_credits(
         db,
@@ -92,16 +116,26 @@ def _process_refund(db, event) -> None:
     """Claw back credits for a settled Stripe refund (clamped at zero)."""
     refund = event["data"]["object"]
     try:
-        payment_intent = refund["payment_intent"]
+        payment_intent = _expandable_id(refund["payment_intent"])
         refund_id = refund["id"]
         refund_amount = int(refund["amount"])
     except (KeyError, TypeError, ValueError):
         logger.error("gringotts webhook %s: refund missing fields", event["id"])
-        return
+        raise HTTPException(
+            status_code=503, detail="Refund data incomplete; retry later"
+        ) from None
+    if not payment_intent or not refund_id or refund_amount <= 0:
+        logger.error("gringotts webhook %s: refund has invalid fields", event["id"])
+        raise HTTPException(
+            status_code=503, detail="Refund data incomplete; retry later"
+        )
     try:
         status = refund["status"]
     except (KeyError, TypeError):
-        status = "succeeded"  # older API versions omit it; treat as settled
+        logger.error("gringotts webhook %s: refund status missing", event["id"])
+        raise HTTPException(
+            status_code=503, detail="Refund status missing; retry later"
+        ) from None
     if status != "succeeded":
         # A pending/failed/canceled refund hasn't returned money — wait for the
         # refund.updated that flips it to succeeded (no row written yet, so that
@@ -127,12 +161,19 @@ def _process_dispute(db, event, *, reinstate: bool) -> None:
     """Claw back on a withdrawn dispute, re-credit on a reinstated one."""
     dispute = event["data"]["object"]
     try:
-        payment_intent = dispute["payment_intent"]
+        payment_intent = _expandable_id(dispute["payment_intent"])
         dispute_id = dispute["id"]
         dispute_amount = int(dispute["amount"])
     except (KeyError, TypeError, ValueError):
         logger.error("gringotts webhook %s: dispute missing fields", event["id"])
-        return
+        raise HTTPException(
+            status_code=503, detail="Dispute data incomplete; retry later"
+        ) from None
+    if not payment_intent or not dispute_id or dispute_amount <= 0:
+        logger.error("gringotts webhook %s: dispute has invalid fields", event["id"])
+        raise HTTPException(
+            status_code=503, detail="Dispute data incomplete; retry later"
+        )
     withdrawn_key = f"{dispute_id}:withdrawn"
     if not reinstate:
         _apply_reversal(
@@ -393,11 +434,34 @@ def build_router(config: GringottsConfig) -> APIRouter:
             try:
                 amount_cents = int(session["amount_total"])
             except (KeyError, TypeError, ValueError):
-                amount_cents = None
+                logger.error(
+                    "gringotts webhook %s: paid checkout amount missing", event["id"]
+                )
+                raise HTTPException(
+                    status_code=503, detail="Checkout amount missing; retry later"
+                ) from None
+            if amount_cents < 0:
+                logger.error(
+                    "gringotts webhook %s: invalid checkout amount=%s",
+                    event["id"],
+                    amount_cents,
+                )
+                raise HTTPException(
+                    status_code=503, detail="Checkout amount invalid; retry later"
+                )
             try:
-                payment_intent_id = session["payment_intent"]
+                payment_intent_id = _expandable_id(session["payment_intent"])
             except (KeyError, TypeError):
                 payment_intent_id = None
+            if amount_cents and not payment_intent_id:
+                logger.error(
+                    "gringotts webhook %s: paid checkout PaymentIntent missing",
+                    event["id"],
+                )
+                raise HTTPException(
+                    status_code=503,
+                    detail="Checkout PaymentIntent missing; retry later",
+                )
             user = crud.get_user(db, user_id)
             if user is None:
                 # Usually transient (the user existed when checkout was created;

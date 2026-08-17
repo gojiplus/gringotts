@@ -5,8 +5,9 @@ timeout) must not be charged or granted twice. The mechanism is an ``Idempotency
 Key`` header plus this ASGI middleware: the first request with a given key runs
 normally and its response is captured into ``idempotency_records``; any later
 request carrying the same key from the same caller gets that stored response back
-**verbatim, without re-running the handler** — so the charge (and any other side
-effect in the handler) happens exactly once.
+without re-running the handler — so the charge (and any other side effect in the
+handler) happens exactly once. Responses that are unsafe or too large to retain
+replay a marker instead of the original body, while still keeping the key locked.
 
 Because the replay short-circuits above the route, it also means a retry can never
 double-charge, never re-run the handler for free, and never race the original's
@@ -22,22 +23,23 @@ Design choices (documented, not incidental):
 - **A fingerprint** (method + path + query + body) guards the key: reusing it for
   a materially different request returns ``409`` rather than the wrong cached
   response.
-- **A raised exception releases the key; a returned response is cached.** gringotts
-  charges *before* the handler runs, and ``Depends(charge())`` refunds on a raised
-  exception — so a handler that raises is treated as rolled back and a genuine retry
-  re-attempts, while any response the handler *returns* (2xx, 4xx, even a 5xx it
-  returns itself) leaves the charge committed and is cached, so a retry can't run it
-  again. A caller who wants a fresh attempt uses a fresh key.
+- **A confirmed refund releases the key; a committed charge keeps it.** gringotts
+  charges *before* the handler runs, and ``Depends(charge())`` compensates on a
+  raised exception. The key is released only after that refund commits, so a genuine
+  retry can re-attempt. If compensation fails, the key stays locked because the debit
+  still stands. Any response the handler *returns* (2xx, 4xx, even a 5xx it returns
+  itself) leaves the charge committed and is cached, so a retry can't run it again.
+  A caller who wants a fresh attempt uses a fresh key.
 - **An in-flight or crashed request is never re-run automatically.** A concurrent
   duplicate, and any retry of a request whose outcome is unknown, gets ``409`` —
   because age alone can't prove the first attempt didn't already charge. Records
   expire after ``retention_seconds`` so a key is eventually reusable and the table
   doesn't grow without bound; operators can also purge with ``gringotts
   prune-idempotency``.
-- **Bounded buffering.** A request body over ``max_body_bytes`` or a response over
-  ``max_response_bytes`` is streamed through uncached rather than held in memory,
-  and a client disconnect mid-upload passes through without caching a truncated
-  request.
+- **Bounded buffering.** A request body over ``max_body_bytes`` is rejected with
+  ``413`` before the app runs. A response over ``max_response_bytes`` reaches the
+  client normally, then replays a small marker on retries. A client disconnect
+  mid-upload runs nothing and stores nothing.
 - **Client disconnects are not cached** and never release a committed charge: a
   ``CancelledError`` raised as the response streams is left to propagate, so the
   record stays and the retry gets ``409`` rather than risking a re-charge.
@@ -109,7 +111,7 @@ class IdempotencyMiddleware:
         app: The wrapped ASGI application.
         header: The header carrying the idempotency key.
         max_key_length: Keys longer than this are rejected with ``400``.
-        max_body_bytes: A request body larger than this is passed through uncached.
+        max_body_bytes: A request body larger than this is rejected with ``413``.
         max_response_bytes: A response larger than this is streamed but not cached.
         retention_seconds: A record older than this is treated as expired.
     """
@@ -183,7 +185,7 @@ class IdempotencyMiddleware:
         fingerprint = _fingerprint(
             scope["method"], scope["path"], scope.get("query_string", b""), body
         )
-        outcome, record_id, stored = await run_in_threadpool(
+        outcome, claim, stored = await run_in_threadpool(
             self._claim, api_key_hash, key, fingerprint
         )
 
@@ -200,7 +202,7 @@ class IdempotencyMiddleware:
             return
 
         # outcome == "new": run the app, capturing its response for storage.
-        assert record_id is not None  # noqa: S101 - guaranteed by a "new" outcome
+        assert claim is not None  # noqa: S101 - guaranteed by a "new" outcome
 
         replayed = {"done": False}
 
@@ -246,34 +248,31 @@ class IdempotencyMiddleware:
         try:
             await self.app(scope, replay_receive, send_wrapper)
         except Exception:
-            if not captured["started"]:
-                # The handler raised before responding. Under the documented pattern
-                # (Depends(charge())) that is refunded by the dependency, so release
-                # the key for a genuine retry; ServerErrorMiddleware (outside us)
-                # then produces the 500. A CancelledError from a client disconnect
-                # is a BaseException, so it isn't caught here — the record stays and
-                # the retry gets 409 rather than risking a re-charge.
-                await run_in_threadpool(self._delete, record_id)
+            # Release the key ONLY on a confirmed refund (net-zero charge). A
+            # committed-but-not-refunded charge — including one whose refund failed
+            # — must keep the key locked so a retry can't double it. If the refund
+            # committed, a retry can safely re-attempt.
+            if _refunded(scope):
+                await run_in_threadpool(self._delete, claim)
             else:
-                # The response already began (e.g. a BackgroundTask raised after the
-                # handler returned, or a stream broke mid-body): the client got
-                # (most of) its result, so cache the outcome and keep the key locked
-                # rather than let a retry re-run the handler.
-                await run_in_threadpool(self._persist, record_id, captured)
+                await run_in_threadpool(self._persist, claim, captured)
             raise
 
-        # The handler RETURNED. If the charge dependency refunded (e.g. it raised
-        # an HTTPException that the exception middleware turned into a 5xx), that is
-        # a transient failure — release the key so a retry re-attempts. Otherwise
-        # the side effect is committed, so cache the outcome (a retry can't re-run
-        # it). A FastAPI slash-redirect ran no handler at all, so release its key so
-        # the client can follow the redirect under the new path's fingerprint.
-        if _refunded(scope) or _is_slash_redirect(
+        # The handler RETURNED. Release the key only when no net charge stands:
+        #  - a confirmed refund (e.g. an HTTPException turned into a 5xx) → retryable
+        #  - a FastAPI slash-redirect that ran NO handler (so no charge committed) →
+        #    release so the client's redirect-follow isn't a 409.
+        # A committed charge (even one that then returned a redirect) is cached so a
+        # retry can never re-run it.
+        released = _refunded(scope)
+        committed = _committed(scope)
+        slash = not committed and _is_slash_redirect(
             captured["status"], captured["headers"], scope["path"]
-        ):
-            await run_in_threadpool(self._delete, record_id)
+        )
+        if released or slash:
+            await run_in_threadpool(self._delete, claim)
         else:
-            await run_in_threadpool(self._persist, record_id, captured)
+            await run_in_threadpool(self._persist, claim, captured)
 
     async def _read_body(self, receive):
         """Drain the request body, bounded, detecting a mid-upload disconnect.
@@ -308,13 +307,21 @@ class IdempotencyMiddleware:
         await send({"type": "http.response.body", "body": body})
 
     async def _send_replay(self, send, status: int, body: bytes, headers_json) -> None:
-        """Replay a stored response: its headers, a fresh length, a replay marker."""
+        """Replay a stored response: its headers, a fresh length, a replay marker.
+
+        We send one complete body, so any framing from the original — the stored
+        ``Content-Length`` or a ``Transfer-Encoding: chunked`` from a streaming
+        response — is dropped and recomputed; sending both would violate RFC 9112
+        and crash strict ASGI servers. A bodyless status (204/304/1xx) gets no
+        ``Content-Length`` at all, which RFC 9110 forbids there.
+        """
         headers = [
             (name, value)
             for name, value in _load_headers(headers_json)
-            if name.lower() != b"content-length"
+            if name.lower() not in (b"content-length", b"transfer-encoding")
         ]
-        headers.append((b"content-length", str(len(body)).encode("latin-1")))
+        if not _is_bodyless(status):
+            headers.append((b"content-length", str(len(body)).encode("latin-1")))
         headers.append((b"idempotent-replayed", b"true"))
         await send(
             {"type": "http.response.start", "status": status, "headers": headers}
@@ -336,9 +343,11 @@ class IdempotencyMiddleware:
     def _claim(self, api_key_hash: str, key: str, fingerprint: str):
         """Reserve the key or report its prior state. Runs in a worker thread.
 
-        Returns ``(outcome, record_id, stored)`` where outcome is one of
+        Returns ``(outcome, claim, stored)`` where outcome is one of
         ``new`` / ``replay`` / ``conflict`` / ``in_progress``. An in-progress
         record is never reclaimed by age — an unknown outcome stays a ``409``.
+        A new claim is ``(record_id, created_at)`` so later writes can reject a
+        primary key that has been deleted and reused for another request.
         """
         session = db.SessionLocal()
         try:
@@ -373,7 +382,7 @@ class IdempotencyMiddleware:
                 )
                 session.commit()
                 if reclaimed:
-                    return ("new", record.id, None)
+                    return ("new", (record.id, now), None)
                 # Lost the reclaim race: re-read and classify the winner's row.
                 record = self._get(session, api_key_hash, key)
                 if record is None:  # pragma: no cover - vanished mid-race
@@ -395,7 +404,7 @@ class IdempotencyMiddleware:
                     if record is None:  # pragma: no cover - vanished mid-race
                         return ("in_progress", None, None)
                 else:
-                    return ("new", fresh.id, None)
+                    return ("new", (fresh.id, fresh.created_at), None)
 
             if record.request_fingerprint != fingerprint:
                 return ("conflict", None, None)
@@ -409,7 +418,7 @@ class IdempotencyMiddleware:
         finally:
             session.close()
 
-    def _persist(self, record_id: int, captured: dict) -> None:
+    def _persist(self, claim: tuple[int, datetime], captured: dict) -> None:
         """Store a handler's captured response under a record. Worker thread.
 
         The body is replaced with a small JSON marker (keeping the key locked so a
@@ -436,7 +445,7 @@ class IdempotencyMiddleware:
             # positive Content-Length there is malformed and servers may reject it.
             if _is_bodyless(captured["status"]):
                 self._store(
-                    record_id,
+                    claim,
                     captured["status"],
                     b"",
                     _dump_headers(
@@ -445,7 +454,7 @@ class IdempotencyMiddleware:
                 )
             else:
                 self._store(
-                    record_id,
+                    claim,
                     captured["status"],
                     _MARKER_BODY,
                     _dump_headers(
@@ -458,39 +467,57 @@ class IdempotencyMiddleware:
                 )
         else:
             self._store(
-                record_id,
+                claim,
                 captured["status"],
                 bytes(captured["body"]),
                 _dump_headers(captured["headers"]),
             )
 
     def _store(
-        self, record_id: int, status: int, body: bytes, headers_json: str
+        self,
+        claim: tuple[int, datetime],
+        status: int,
+        body: bytes,
+        headers_json: str,
     ) -> None:
-        """Mark a record complete with its captured response. Worker thread."""
+        """Mark this exact claim complete with its captured response."""
+        record_id, created_at = claim
         session = db.SessionLocal()
         try:
-            record = session.get(IdempotencyRecord, record_id)
-            if record is None:  # pragma: no cover - reclaimed/deleted concurrently
-                return
-            record.completed = True
-            record.status_code = status
-            record.response_body = body
-            record.response_headers = headers_json
+            # The creation timestamp is the claim generation. If an operator
+            # explicitly purged this in-flight row and its integer PK was reused,
+            # the old request must not complete the new owner's record.
+            session.query(IdempotencyRecord).filter(
+                IdempotencyRecord.id == record_id,
+                IdempotencyRecord.created_at == created_at,
+                IdempotencyRecord.completed.is_(False),
+            ).update(
+                {
+                    IdempotencyRecord.completed: True,
+                    IdempotencyRecord.status_code: status,
+                    IdempotencyRecord.response_body: body,
+                    IdempotencyRecord.response_headers: headers_json,
+                },
+                synchronize_session=False,
+            )
             session.commit()
         finally:
             session.close()
 
-    def _delete(self, record_id: int) -> None:
-        """Drop an in-progress record so its key can be retried. Worker thread.
+    def _delete(self, claim: tuple[int, datetime]) -> None:
+        """Drop this exact in-progress claim so its key can be retried.
 
         A filtered bulk delete (not ``session.delete``) so a concurrent delete of
-        the same row can't raise StaleDataError.
+        the same row can't raise StaleDataError. The generation guard prevents an
+        old request from deleting a newer claim if its primary key was reused.
         """
+        record_id, created_at = claim
         session = db.SessionLocal()
         try:
             session.query(IdempotencyRecord).filter(
-                IdempotencyRecord.id == record_id
+                IdempotencyRecord.id == record_id,
+                IdempotencyRecord.created_at == created_at,
+                IdempotencyRecord.completed.is_(False),
             ).delete(synchronize_session=False)
             session.commit()
         finally:
@@ -522,7 +549,9 @@ def _dump_headers(headers, extra=None) -> str:
     pairs = [
         [name.decode("latin-1"), value.decode("latin-1")]
         for name, value in headers
-        if name.lower() != b"content-length"
+        # content-length is recomputed on replay; transfer-encoding (chunked) is
+        # meaningless for a stored complete body and would collide with it.
+        if name.lower() not in (b"content-length", b"transfer-encoding")
     ]
     if extra:
         pairs.extend([list(pair) for pair in extra])
@@ -535,8 +564,13 @@ def _is_bodyless(status: int) -> bool:
 
 
 def _refunded(scope) -> bool:
-    """Whether the charge dependency signalled it refunded this request."""
+    """Whether the charge dependency signalled a *confirmed* refund of this request."""
     return bool(scope.get("gringotts_idempotency", {}).get("refunded"))
+
+
+def _committed(scope) -> bool:
+    """Whether the charge dependency signalled it committed a charge this request."""
+    return bool(scope.get("gringotts_idempotency", {}).get("committed"))
 
 
 def _is_slash_redirect(status: int, headers, path: str) -> bool:

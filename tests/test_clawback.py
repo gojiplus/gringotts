@@ -10,6 +10,7 @@ from test_router import WEBHOOK_SECRET, make_app, sign
 
 from gringotts import auth, crud, models
 from gringotts.db import Base, make_engine
+from gringotts.router import _round_proportional
 
 
 def test_concurrent_partial_refunds_do_not_over_claw(tmp_path):
@@ -110,6 +111,7 @@ def _refund_event(pi, amount, refund_id="re_1", event_id="evt_r"):
                     "object": "refund",
                     "payment_intent": pi,
                     "amount": amount,
+                    "status": "succeeded",
                 }
             },
         }
@@ -156,6 +158,14 @@ def test_purchase_stores_payment_intent(db_session):
     assert row.payment_intent_id == "pi_1"
     assert row.amount == 100
     assert row.amount_cents == 500
+
+
+def test_proportional_rounding_is_exact_above_float_precision():
+    credits = 9_007_199_254_740_993
+    assert (
+        _round_proportional(credits, 33_333_333, 100_000_000) == 3_002_399_721_556_333
+    )
+    assert round(credits * 33_333_333 / 100_000_000) != 3_002_399_721_556_333
 
 
 def test_full_refund_claws_back_all(db_session):
@@ -292,6 +302,16 @@ def test_pending_refund_is_not_clawed_until_succeeded(db_session):
     assert _post(client, json.dumps(succeeded).encode()).status_code == 200
     db_session.refresh(user)
     assert user.credits == 0
+
+
+def test_refund_without_status_asks_retry(db_session):
+    client = _client()
+    user = _buy(db_session, client, "p_missing_status")
+    refund = json.loads(_refund_event("pi_1", 500).decode())
+    del refund["data"]["object"]["status"]
+    assert _post(client, json.dumps(refund).encode()).status_code == 503
+    db_session.refresh(user)
+    assert user.credits == 100
 
 
 def test_dispute_is_proportional_after_partial_refund(db_session):

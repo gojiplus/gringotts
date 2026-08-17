@@ -73,6 +73,12 @@ def charge(cost: CostSpec) -> Callable[..., Iterator[User]]:
             endpoint = request.url.path
             if not crud.charge_user(session, user, amount, endpoint=endpoint):
                 raise PaymentRequiredError(cost=amount, balance=user.credits)
+            scope = getattr(request, "scope", None)
+            if amount and scope is not None:
+                # The debit is durable from this point onward. Idempotency must
+                # keep the key unless compensation is later confirmed, otherwise
+                # a failed refund followed by a retry can charge twice.
+                scope.setdefault("gringotts_idempotency", {})["committed"] = True
             user_id = user.id
             try:
                 yield user
@@ -82,13 +88,10 @@ def charge(cost: CostSpec) -> Callable[..., Iterator[User]]:
                 # alone would let it consume credits for undelivered work).
                 # GeneratorExit is deliberately not caught: it fires on normal
                 # close and must not trigger a refund.
-                _refund_on_fresh_session(user_id, amount, endpoint)
-                # Tell IdempotencyMiddleware the charge was refunded (net zero), so
-                # it releases the key even when the exception is later turned into a
-                # returned response (e.g. HTTPException(503)) — that request is a
-                # transient failure and a retry must be able to re-attempt.
-                scope = getattr(request, "scope", None)
-                if scope is not None:
+                refunded = _refund_on_fresh_session(user_id, amount, endpoint)
+                # Release the key only after compensation committed. A failed
+                # refund leaves the debit standing, so a retry must be blocked.
+                if refunded and scope is not None:
                     scope.setdefault("gringotts_idempotency", {})["refunded"] = True
                 raise
         finally:
@@ -97,7 +100,7 @@ def charge(cost: CostSpec) -> Callable[..., Iterator[User]]:
     return dependency
 
 
-def _refund_on_fresh_session(user_id: int, amount: int, endpoint: str) -> None:
+def _refund_on_fresh_session(user_id: int, amount: int, endpoint: str) -> bool:
     """Compensate a charge on a brand-new session.
 
     Using a fresh session means a failing handler's uncommitted mutations to
@@ -107,10 +110,14 @@ def _refund_on_fresh_session(user_id: int, amount: int, endpoint: str) -> None:
     session = db.SessionLocal()
     try:
         user = crud.get_user(session, user_id)
-        if user is not None:
-            crud.refund_user(session, user, amount, endpoint=endpoint)
+        if user is None:
+            logger.error("gringotts: refund user %s no longer exists", user_id)
+            return False
+        crud.refund_user(session, user, amount, endpoint=endpoint)
+        return True
     except Exception:
         # Best-effort: never let a failed refund mask the original exception.
         logger.exception("gringotts: refund failed for user %s", user_id)
+        return False
     finally:
         session.close()

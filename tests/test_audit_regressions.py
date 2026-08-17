@@ -156,6 +156,7 @@ def _event(user_id, credits, event_id, session_id, payment_status="paid"):
         "object": "checkout.session",
         "amount_total": 500,
         "metadata": {"gringotts_user_id": str(user_id), "credits": str(credits)},
+        "payment_intent": f"pi_{session_id}",
     }
     if payment_status is not None:
         obj["payment_status"] = payment_status
@@ -208,6 +209,7 @@ def test_c2_async_succeeded_credits(db_session):
         "object": "checkout.session",
         "amount_total": 500,
         "payment_status": "paid",
+        "payment_intent": "pi_ach",
         "metadata": {"gringotts_user_id": str(user.id), "credits": "100"},
     }
     payload = json.dumps(
@@ -222,6 +224,20 @@ def test_c2_async_succeeded_credits(db_session):
     assert _post(TestClient(make_stripe_app()), payload).status_code == 200
     db_session.refresh(user)
     assert user.credits == 100
+
+
+@pytest.mark.parametrize("missing", ["amount_total", "payment_intent"])
+def test_paid_checkout_with_incomplete_accounting_data_asks_retry(db_session, missing):
+    user, _ = auth.create_user_with_key(db_session, f"missing-{missing}", credits=0)
+    payload = json.loads(
+        _event(user.id, 100, f"evt_{missing}", f"cs_{missing}").decode()
+    )
+    del payload["data"]["object"][missing]
+    response = _post(TestClient(make_stripe_app()), json.dumps(payload).encode())
+    assert response.status_code == 503
+    db_session.refresh(user)
+    assert user.credits == 0
+    assert db_session.query(models.CreditTransaction).count() == 0
 
 
 def test_c6_unknown_user_asks_stripe_to_retry(db_session, caplog):

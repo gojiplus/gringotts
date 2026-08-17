@@ -51,6 +51,7 @@ def checkout_completed_event(
                     "object": "checkout.session",
                     "amount_total": 500,
                     "payment_status": "paid",
+                    "payment_intent": "pi_test_1",
                     "metadata": {
                         "gringotts_user_id": str(user_id),
                         "credits": str(credits),
@@ -142,6 +143,7 @@ def test_webhook_credits_user(db_session):
     assert row.external_id == "cs_test_1"
     assert row.amount == 100
     assert row.amount_cents == 500
+    assert row.payment_intent_id == "pi_test_1"
 
 
 def test_webhook_is_idempotent(db_session):

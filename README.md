@@ -186,7 +186,7 @@ Payments Protocol) can be added later without breaking the shape.
 
 ## How it stores things
 
-Two tables, created by `gringotts init-db`:
+Three tables, created by `gringotts init-db`:
 
 - `users` — username, SHA-256 hash of the API key (the key itself is shown
   once and never stored), last 4 characters for display, current balance. A
@@ -200,6 +200,10 @@ Two tables, created by `gringotts init-db`:
   carry the Stripe checkout session id under a unique constraint — that's what
   makes webhook crediting idempotent, even when Stripe sends more than one event
   for the same session.
+- `idempotency_records` — one response-cache row per caller and
+  `Idempotency-Key`. The unique caller/key index elects one request to run; a
+  concurrent duplicate gets `409`, and a later retry replays the stored result
+  without running or charging again.
 
 Works on SQLite out of the box and Postgres via
 `DATABASE_URL=postgresql://...` (both run in CI, including a parallel-writer
