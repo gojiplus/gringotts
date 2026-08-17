@@ -758,14 +758,14 @@ def test_percent_encoded_slash_redirect_does_not_conflict(db_session):
     app = FastAPI()
     gringotts.init_app(app, GringottsConfig())
 
-    @app.post("/café/")
-    def cafe(user: CreditedUser = Depends(charge(1))):
+    @app.post("/東京/")
+    def tokyo(user: CreditedUser = Depends(charge(1))):
         return {"ok": True}
 
     user, key = auth.create_user_with_key(db_session, "encoded-redirect", credits=10)
     client = TestClient(app)
     response = client.post(
-        "/caf%C3%A9",
+        "/%E6%9D%B1%E4%BA%AC",
         headers={"X-API-Key": key, "Idempotency-Key": "encoded-key"},
         follow_redirects=True,
     )
