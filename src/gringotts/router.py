@@ -96,23 +96,28 @@ def _checkout_fields(session):
     )
 
 
-def _checkout_order_marker(session) -> str | None:
+def _checkout_order_marker(session, db: Session) -> str | None:
     """Return this library's order marker, or None for unrelated Checkout."""
-    try:
-        reference = session["client_reference_id"]
-    except (KeyError, TypeError):
-        reference = None
-    if isinstance(reference, str) and reference:
-        return reference
     try:
         metadata_reference = session["metadata"]["gringotts_order_id"]
     except (KeyError, TypeError):
+        metadata_reference = None
+    if isinstance(metadata_reference, str) and metadata_reference:
+        return metadata_reference
+    try:
+        reference = session["client_reference_id"]
+    except (KeyError, TypeError):
         return None
-    return (
-        metadata_reference
-        if isinstance(metadata_reference, str) and metadata_reference
-        else None
-    )
+    if (
+        isinstance(reference, str)
+        and reference
+        and crud.get_checkout_order(db, reference) is not None
+    ):
+        # Our immutable event snapshot may be missing metadata. A reference only
+        # identifies Gringotts after it resolves to an order persisted locally;
+        # unrelated Checkout integrations can use their own client references.
+        return reference
+    return None
 
 
 def _retrieve_checkout(session, event_id: str, stripe_secret_key: str | None):
@@ -606,7 +611,7 @@ def build_router(config: GringottsConfig) -> APIRouter:
 
         if event["type"] in _FULFILL_EVENTS:
             session = event["data"]["object"]
-            if _checkout_order_marker(session) is None:
+            if _checkout_order_marker(session, db) is None:
                 # The Stripe account may host unrelated Checkout integrations.
                 # A valid Stripe signature alone does not authorize credits.
                 logger.info(

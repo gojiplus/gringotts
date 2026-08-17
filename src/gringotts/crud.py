@@ -264,6 +264,11 @@ def bind_checkout_order(
     return order
 
 
+def get_checkout_order(db: Session, order_id: str) -> models.CheckoutOrder | None:
+    """Return a locally authorized Checkout order, or None."""
+    return db.get(models.CheckoutOrder, order_id)
+
+
 def external_id_exists(db: Session, external_id: str) -> bool:
     """Whether a ledger row already carries this external id."""
     return (

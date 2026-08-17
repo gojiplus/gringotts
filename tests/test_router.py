@@ -310,6 +310,42 @@ def test_webhook_does_not_fulfill_an_unregistered_checkout(db_session):
     )
 
 
+def test_webhook_ignores_unrelated_checkout_with_its_own_client_reference(
+    db_session, monkeypatch
+):
+    session = {
+        "id": "cs_other_app",
+        "object": "checkout.session",
+        "amount_total": 500,
+        "currency": "usd",
+        "payment_status": "paid",
+        "payment_intent": "pi_other_app",
+        "client_reference_id": "other-app-cart-123",
+        "metadata": {"other_app": "true"},
+    }
+    payload = json.dumps(
+        {
+            "id": "evt_other_app",
+            "object": "event",
+            "api_version": "2024-06-20",
+            "type": "checkout.session.completed",
+            "data": {"object": session},
+        }
+    ).encode()
+    monkeypatch.setattr(
+        "stripe.checkout.Session.retrieve", lambda *args, **kwargs: session
+    )
+
+    response = TestClient(make_app()).post(
+        "/gringotts/webhook",
+        content=payload,
+        headers={"stripe-signature": sign(payload)},
+    )
+
+    assert response.status_code == 200
+    assert db_session.query(models.CreditTransaction).count() == 0
+
+
 def test_webhook_rejects_checkout_that_disagrees_with_authorized_order(db_session):
     user, _ = auth.create_user_with_key(db_session, "mismatch", credits=0)
     order_id = authorize_checkout(db_session, user.id)

@@ -754,6 +754,28 @@ def test_slash_redirect_does_not_conflict(db_session):
     assert user.credits == 8  # charged once at /x/
 
 
+def test_percent_encoded_slash_redirect_does_not_conflict(db_session):
+    app = FastAPI()
+    gringotts.init_app(app, GringottsConfig())
+
+    @app.post("/café/")
+    def cafe(user: CreditedUser = Depends(charge(1))):
+        return {"ok": True}
+
+    user, key = auth.create_user_with_key(db_session, "encoded-redirect", credits=10)
+    client = TestClient(app)
+    response = client.post(
+        "/caf%C3%A9",
+        headers={"X-API-Key": key, "Idempotency-Key": "encoded-key"},
+        follow_redirects=True,
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"ok": True}
+    db_session.refresh(user)
+    assert user.credits == 9
+
+
 def test_endpoint_slash_redirect_after_charge_is_cached(db_session):
     # an endpoint that CHARGES then itself returns a 307 to its own path+slash must
     # NOT be mistaken for a router redirect and released — that would double-charge

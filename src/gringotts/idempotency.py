@@ -64,6 +64,7 @@ Limitations (deliberate trade-offs for a money library):
 import hashlib
 import json
 from datetime import UTC, datetime
+from urllib.parse import unquote, urlsplit
 
 from sqlalchemy.exc import IntegrityError
 from starlette.concurrency import run_in_threadpool
@@ -629,10 +630,10 @@ def _is_slash_redirect(status: int, headers, path: str) -> bool:
             break
     if loc is None:
         return False
-    loc_path = loc.split("?", 1)[0]
-    if "://" in loc_path:  # strip scheme://host, leaving the path
-        rest = loc_path.split("://", 1)[1]
-        loc_path = "/" + rest.split("/", 1)[1] if "/" in rest else "/"
+    # ASGI scope["path"] is percent-decoded, while Starlette preserves percent
+    # encoding in Location. Compare the same decoded representation so Unicode
+    # routes do not cache the router's redirect and conflict on the follow-up.
+    loc_path = unquote(urlsplit(loc).path)
     # same path modulo a toggled trailing slash (not an identical URL)
     return loc_path != path and loc_path.rstrip("/") == path.rstrip("/")
 
