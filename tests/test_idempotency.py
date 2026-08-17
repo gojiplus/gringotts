@@ -347,6 +347,44 @@ def test_expired_record_reruns(db_session):
     assert user.credits == 6  # both charged; the cached row expired
 
 
+def test_pruned_expired_record_is_claimed_without_spurious_conflict(
+    db_session, monkeypatch
+):
+    middleware = IdempotencyMiddleware(None, retention_seconds=0)
+    record = models.IdempotencyRecord(
+        api_key_hash="caller",
+        idempotency_key="expired",
+        request_fingerprint="old",
+        completed=True,
+        status_code=200,
+        response_body=b"old",
+        response_headers="[]",
+        created_at=datetime.now(UTC) - timedelta(days=1),
+    )
+    db_session.add(record)
+    db_session.commit()
+
+    original_get = IdempotencyMiddleware._get
+    first = True
+
+    def get_with_prune(session, api_key_hash, key):
+        nonlocal first
+        found = original_get(session, api_key_hash, key)
+        if first:
+            first = False
+            session.query(models.IdempotencyRecord).filter_by(id=found.id).delete(
+                synchronize_session=False
+            )
+            session.flush()
+        return found
+
+    monkeypatch.setattr(middleware, "_get", get_with_prune)
+    outcome, claim, _ = middleware._claim("caller", "expired", "new")
+    assert outcome == "new"
+    assert claim is not None
+    assert db_session.query(models.IdempotencyRecord).count() == 1
+
+
 def test_response_over_cap_keeps_lock_and_charges_once(db_session):
     app = FastAPI()
     gringotts.init_app(app, GringottsConfig(idempotency_max_response_bytes=10))
@@ -705,6 +743,29 @@ def test_endpoint_slash_redirect_after_charge_is_cached(db_session):
     assert r2.headers.get("idempotent-replayed") == "true"
     db_session.refresh(user)
     assert user.credits == 8  # charged once
+
+
+def test_endpoint_slash_redirect_without_charge_is_cached(db_session):
+    from fastapi.responses import RedirectResponse
+
+    app = FastAPI()
+    gringotts.init_app(app, GringottsConfig())
+    calls = 0
+
+    @app.post("/z")
+    def z():
+        nonlocal calls
+        calls += 1
+        return RedirectResponse("/z/", status_code=307)
+
+    _, key = auth.create_user_with_key(db_session, "zz", credits=0)
+    client = TestClient(app)
+    headers = {"X-API-Key": key, "Idempotency-Key": "zk"}
+    assert client.post("/z", headers=headers, follow_redirects=False).status_code == 307
+    replay = client.post("/z", headers=headers, follow_redirects=False)
+    assert replay.status_code == 307
+    assert replay.headers.get("idempotent-replayed") == "true"
+    assert calls == 1
 
 
 def test_refund_failure_keeps_key_locked(db_session, monkeypatch):

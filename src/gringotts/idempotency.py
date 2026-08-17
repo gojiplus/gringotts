@@ -266,8 +266,16 @@ class IdempotencyMiddleware:
         # retry can never re-run it.
         released = _refunded(scope)
         committed = _committed(scope)
-        slash = not committed and _is_slash_redirect(
-            captured["status"], captured["headers"], scope["path"]
+        slash = (
+            not committed
+            # FastAPI adds ``endpoint`` only after a route matches and runs. Its
+            # automatic slash redirect happens before that; requiring the marker
+            # prevents an endpoint's own same-path redirect from releasing the
+            # claim and repeating an uncharged side effect.
+            and "endpoint" not in scope
+            and _is_slash_redirect(
+                captured["status"], captured["headers"], scope["path"]
+            )
         )
         if released or slash:
             await run_in_threadpool(self._delete, claim)
@@ -384,9 +392,9 @@ class IdempotencyMiddleware:
                 if reclaimed:
                     return ("new", (record.id, now), None)
                 # Lost the reclaim race: re-read and classify the winner's row.
+                # A concurrent prune can instead have removed the completed row;
+                # in that case fall through to the normal insert race below.
                 record = self._get(session, api_key_hash, key)
-                if record is None:  # pragma: no cover - vanished mid-race
-                    return ("in_progress", None, None)
             if record is None:
                 fresh = IdempotencyRecord(
                     api_key_hash=api_key_hash,

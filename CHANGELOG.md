@@ -61,6 +61,11 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Concurrent first attempts are serialized by the caller/key claim, and stale
   requests cannot mutate a newer claim after emergency in-flight pruning and
   primary-key reuse.
+- Handler-generated trailing-slash redirects retain and replay their key even when
+  no credit charge occurred; only FastAPI's pre-route automatic redirect releases
+  the claim for the redirected request.
+- Pruning an expired completed record concurrently with lazy key reclamation no
+  longer produces a spurious in-progress conflict.
 - Proportional Stripe clawbacks use exact integer rounding rather than floats, so
   large credit balances cannot be over- or under-clawed through precision loss.
 - Paid Checkout, refund, and dispute events with incomplete settlement data return a
