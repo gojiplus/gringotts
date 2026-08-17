@@ -66,13 +66,26 @@ def build_admin_router(config: GringottsConfig) -> APIRouter:
         data = crud.aggregate_stats(db)
         if not _is_htmx(request):
             return JSONResponse(data)
-        currency = config.packs[0].currency if config.packs else "usd"
+        revenue = data["revenue_by_currency"]
+        if not revenue and config.packs:
+            revenue = {config.packs[0].currency: 0}
+        revenue_tiles = "".join(
+            pages.tile(
+                (
+                    f"{amount:,} minor units"
+                    if currency == "unknown"
+                    else format_money(amount, currency)
+                ),
+                "revenue" if len(revenue) == 1 else f"revenue ({currency.upper()})",
+            )
+            for currency, amount in revenue.items()
+        )
         tiles = (
             pages.tile(str(data["users"]), "users")
             + pages.tile(str(data["credits_outstanding"]), "credits outstanding")
             + pages.tile(str(data["credits_consumed"]), "credits consumed")
             + pages.tile(str(data["credits_purchased"]), "credits purchased")
-            + pages.tile(format_money(data["revenue_cents"], currency), "revenue")
+            + revenue_tiles
         )
         return HTMLResponse(f'<div class="tiles">{tiles}</div>')
 
@@ -190,6 +203,7 @@ def build_admin_router(config: GringottsConfig) -> APIRouter:
                     "kind": t.kind,
                     "endpoint": t.endpoint,
                     "amount_cents": t.amount_cents,
+                    "currency": t.currency,
                     "created_at": t.created_at.isoformat(),
                 }
                 for t in transactions

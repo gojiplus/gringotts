@@ -51,7 +51,9 @@ curl -X POST localhost:8000/predict \
 ```
 
 Keys are scoped to the caller, so one caller can't replay another's key. Reusing a
-key for a materially different request (method, path, or body) returns `409`. A
+key for a materially different request (method, path, any header, or body) returns
+`409`. This includes authorization and dynamic-pricing headers, preventing a replay
+from crossing application principals or operation inputs. A
 raised error whose debit was refunded releases the key, so a genuine retry can
 re-attempt. A handler that returns a `5xx` leaves its debit committed, so that
 response is cached. Responses marked `no-store` or too large to retain replay a

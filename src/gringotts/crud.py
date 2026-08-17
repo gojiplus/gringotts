@@ -1,6 +1,7 @@
 """Database operations: users, atomic credit movements, and ledger queries."""
 
 import logging
+import secrets
 
 from sqlalchemy import case, func
 from sqlalchemy.exc import IntegrityError
@@ -15,6 +16,17 @@ def _require_integer_amount(amount: int) -> None:
     """Reject values that cannot belong in the integer credit ledger."""
     if isinstance(amount, bool) or not isinstance(amount, int):
         raise TypeError("amount must be an integer")
+
+
+def _normalize_currency(currency: str | None) -> str | None:
+    """Validate and normalize a three-letter ISO currency code."""
+    if currency is None:
+        return None
+    if not isinstance(currency, str):
+        raise TypeError("currency must be a string")
+    if len(currency) != 3 or not currency.isalpha():
+        raise ValueError("currency must be a three-letter ISO code")
+    return currency.lower()
 
 
 def create_user(
@@ -147,6 +159,7 @@ def grant_credits(
     external_id: str | None = None,
     amount_cents: int | None = None,
     payment_intent_id: str | None = None,
+    currency: str | None = None,
 ) -> bool:
     """Atomically add credits with a ledger row.
 
@@ -158,6 +171,7 @@ def grant_credits(
     _require_integer_amount(amount)
     if amount < 0:
         raise ValueError("grant amount cannot be negative")
+    normalized_currency = _normalize_currency(currency)
     db.query(models.User).filter(models.User.id == user.id).update(
         {models.User.credits: models.User.credits + amount}
     )
@@ -170,6 +184,7 @@ def grant_credits(
             external_id=external_id,
             amount_cents=amount_cents,
             payment_intent_id=payment_intent_id,
+            currency=normalized_currency,
             balance_after=user.credits,
         )
     )
@@ -185,6 +200,68 @@ def grant_credits(
         raise
     db.refresh(user)
     return True
+
+
+def create_checkout_order(
+    db: Session,
+    user: models.User,
+    credits: int,
+    amount_cents: int,
+    currency: str,
+) -> models.CheckoutOrder:
+    """Persist the exact entitlement authorized before creating Stripe Checkout."""
+    _require_integer_amount(credits)
+    _require_integer_amount(amount_cents)
+    if credits <= 0 or amount_cents < 0:
+        raise ValueError("invalid Checkout order amounts")
+    normalized_currency = _normalize_currency(currency)
+    if normalized_currency is None:
+        raise ValueError("Checkout order currency is required")
+    order = models.CheckoutOrder(
+        id=secrets.token_hex(16),
+        user_id=user.id,
+        credits=credits,
+        amount_cents=amount_cents,
+        currency=normalized_currency,
+    )
+    db.add(order)
+    db.commit()
+    db.refresh(order)
+    return order
+
+
+def bind_checkout_order(
+    db: Session,
+    order_id: str,
+    stripe_session_id: str,
+    *,
+    commit: bool,
+) -> models.CheckoutOrder | None:
+    """Atomically bind an order once to its Stripe Checkout Session."""
+    updated = (
+        db.query(models.CheckoutOrder)
+        .filter(
+            models.CheckoutOrder.id == order_id,
+            (models.CheckoutOrder.stripe_session_id.is_(None))
+            | (models.CheckoutOrder.stripe_session_id == stripe_session_id),
+        )
+        .update(
+            {models.CheckoutOrder.stripe_session_id: stripe_session_id},
+            synchronize_session=False,
+        )
+    )
+    if not updated:
+        existing = db.get(models.CheckoutOrder, order_id)
+        if existing is None:
+            return None
+        raise ValueError("Checkout order is already bound to another Session")
+    order = db.get(models.CheckoutOrder, order_id)
+    assert order is not None  # noqa: S101 - the successful UPDATE proves it exists
+    db.refresh(order)
+    if commit:
+        db.commit()
+        db.refresh(order)
+    return order
 
 
 def external_id_exists(db: Session, external_id: str) -> bool:
@@ -270,6 +347,7 @@ def clawback_credits(
     endpoint: str | None = None,
     amount_cents: int | None = None,
     payment_intent_id: str | None = None,
+    currency: str | None = None,
 ) -> int:
     """Deduct up to `amount` credits (clamped at zero) with a ledger row.
 
@@ -283,6 +361,7 @@ def clawback_credits(
     _require_integer_amount(amount)
     if amount < 0:
         raise ValueError("clawback amount cannot be negative")
+    normalized_currency = _normalize_currency(currency)
     # Lock the user row so the clamp reads a stable balance (Postgres); SQLite
     # serializes writers, so the read-decide-write is atomic there too.
     current = (
@@ -306,6 +385,7 @@ def clawback_credits(
             endpoint=endpoint,
             amount_cents=amount_cents,
             payment_intent_id=payment_intent_id,
+            currency=normalized_currency,
             balance_after=user.credits,
         )
     )
@@ -394,7 +474,7 @@ def list_users_with_stats(db: Session) -> list[dict]:
 
 
 def aggregate_stats(db: Session) -> dict:
-    """Return system totals: users, credits outstanding/consumed/purchased, revenue."""
+    """Return system totals, keeping revenue separated by ISO currency."""
     user_count = db.query(func.count(models.User.id)).scalar() or 0
     outstanding = db.query(func.sum(models.User.credits)).scalar() or 0
 
@@ -415,15 +495,26 @@ def aggregate_stats(db: Session) -> dict:
         + _sum_for("clawback", models.CreditTransaction.amount)
         + _sum_for("reinstate", models.CreditTransaction.amount)
     )
-    # revenue = money paid minus money reversed. clawback rows carry the reversed
-    # cents (positive), reinstate rows the negative offset, so subtracting both
-    # nets a refunded/disputed payment out of revenue.
-    reversed_cents = _sum_for(
-        "clawback", models.CreditTransaction.amount_cents
-    ) + _sum_for("reinstate", models.CreditTransaction.amount_cents)
-    revenue_cents = (
-        _sum_for("purchase", models.CreditTransaction.amount_cents) - reversed_cents
+    money_rows = (
+        db.query(
+            models.CreditTransaction.currency,
+            models.CreditTransaction.kind,
+            func.sum(models.CreditTransaction.amount_cents),
+        )
+        .filter(
+            models.CreditTransaction.kind.in_(("purchase", "clawback", "reinstate")),
+            models.CreditTransaction.amount_cents.is_not(None),
+        )
+        .group_by(models.CreditTransaction.currency, models.CreditTransaction.kind)
+        .all()
     )
+    revenue: dict[str, int] = {}
+    for currency, kind, total in money_rows:
+        key = currency or "unknown"
+        # Purchases add money. Clawbacks carry positive reversed minor units and
+        # reinstatements carry the negative offset, so both are subtracted.
+        delta = int(total or 0) if kind == "purchase" else -int(total or 0)
+        revenue[key] = revenue.get(key, 0) + delta
     return {
         "users": int(user_count),
         "credits_outstanding": int(outstanding),
@@ -431,7 +522,7 @@ def aggregate_stats(db: Session) -> dict:
         "credits_consumed": charged - refunded,
         # net of clawbacks: a refunded/disputed purchase nets back out
         "credits_purchased": purchased,
-        "revenue_cents": revenue_cents,
+        "revenue_by_currency": dict(sorted(revenue.items())),
     }
 
 

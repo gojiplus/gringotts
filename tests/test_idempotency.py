@@ -12,7 +12,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 
-from fastapi import Depends, FastAPI, Response
+from fastapi import Depends, FastAPI, Request, Response
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import sessionmaker
 from test_charge import make_app
@@ -22,6 +22,22 @@ from gringotts import CreditedUser, GringottsConfig, auth, charge, crud, models
 from gringotts import db as gdb
 from gringotts.db import Base, make_engine
 from gringotts.idempotency import IdempotencyMiddleware, _fingerprint
+
+
+def _client_fingerprint(client, method, path, headers):
+    request = client.build_request(method, path, headers=headers)
+    fingerprint_headers = [
+        (name, value)
+        for name, value in request.headers.raw
+        if name.lower() != b"idempotency-key"
+    ]
+    return _fingerprint(
+        method,
+        request.url.path,
+        request.url.query,
+        request.content,
+        fingerprint_headers,
+    )
 
 
 def test_replay_returns_cached_response_and_charges_once(db_session):
@@ -91,19 +107,37 @@ def test_conflict_on_different_request(db_session):
     assert user.credits == 8  # only /hello (cost 2) applied
 
 
-def test_key_pins_the_operation(db_session):
-    # headers aren't part of the fingerprint: the key pins the whole operation to
-    # the first request, so a same-path replay returns the first result verbatim.
+def test_changed_pricing_header_conflicts(db_session):
     user, key = auth.create_user_with_key(db_session, "kp", credits=10)
     client = TestClient(make_app())
     h = {"X-API-Key": key, "Idempotency-Key": "u"}
     r1 = client.get("/units", headers={**h, "X-Units": "1"})  # cost 1
     r2 = client.get("/units", headers={**h, "X-Units": "9"})  # replay of r1
     assert r1.status_code == 200
-    assert r2.status_code == 200
-    assert r2.json() == r1.json()
+    assert r2.status_code == 409
     db_session.refresh(user)
     assert user.credits == 9  # only the first (cost 1) charge applied
+
+
+def test_changed_authorization_header_cannot_replay_cached_response(db_session):
+    app = FastAPI()
+    gringotts.init_app(app, GringottsConfig())
+
+    @app.get("/private")
+    def private(request: Request, user: CreditedUser = Depends(charge(1))):
+        return {"principal": request.headers["Authorization"]}
+
+    user, key = auth.create_user_with_key(db_session, "header-scope", credits=10)
+    client = TestClient(app)
+    common = {"X-API-Key": key, "Idempotency-Key": "same-key"}
+
+    first = client.get("/private", headers={**common, "Authorization": "Alice"})
+    second = client.get("/private", headers={**common, "Authorization": "Bob"})
+
+    assert first.json() == {"principal": "Alice"}
+    assert second.status_code == 409
+    db_session.refresh(user)
+    assert user.credits == 9
 
 
 def test_server_error_is_not_cached_and_retry_reattempts(db_session):
@@ -204,17 +238,18 @@ def test_idempotency_can_be_disabled(db_session):
 def test_in_progress_request_conflicts(db_session):
     # a fresh in-flight record for the same (caller, key) holds off a duplicate
     user, key = auth.create_user_with_key(db_session, "ip", credits=10)
+    client = TestClient(make_app())
+    headers = {"X-API-Key": key, "Idempotency-Key": "ipk"}
     db_session.add(
         models.IdempotencyRecord(
             api_key_hash=auth.get_api_key_hash(key),
             idempotency_key="ipk",
-            request_fingerprint=_fingerprint("GET", "/hello", b"", b""),
+            request_fingerprint=_client_fingerprint(client, "GET", "/hello", headers),
             completed=False,
         )
     )
     db_session.commit()
-    client = TestClient(make_app())
-    r = client.get("/hello", headers={"X-API-Key": key, "Idempotency-Key": "ipk"})
+    r = client.get("/hello", headers=headers)
     assert r.status_code == 409
     db_session.refresh(user)
     assert user.credits == 10  # not charged while the first is in flight
@@ -286,18 +321,19 @@ def test_in_progress_is_never_reclaimed_by_age(db_session):
     # an old in-flight record (owner may have crashed after charging) must NOT be
     # auto-rerun — its outcome is unknown, so a retry stays a 409
     user, key = auth.create_user_with_key(db_session, "st", credits=10)
+    client = TestClient(make_app())
+    headers = {"X-API-Key": key, "Idempotency-Key": "stk"}
     db_session.add(
         models.IdempotencyRecord(
             api_key_hash=auth.get_api_key_hash(key),
             idempotency_key="stk",
-            request_fingerprint=_fingerprint("GET", "/hello", b"", b""),
+            request_fingerprint=_client_fingerprint(client, "GET", "/hello", headers),
             completed=False,
             created_at=datetime.now(UTC) - timedelta(days=2),
         )
     )
     db_session.commit()
-    client = TestClient(make_app())
-    r = client.get("/hello", headers={"X-API-Key": key, "Idempotency-Key": "stk"})
+    r = client.get("/hello", headers=headers)
     assert r.status_code == 409  # ambiguous in-flight op, not re-run
     db_session.refresh(user)
     assert user.credits == 10  # not charged

@@ -60,28 +60,58 @@ def _expandable_id(value) -> str | None:
 def _checkout_fields(session):
     """Extract the fields required to settle a Checkout Session."""
     metadata = session["metadata"]
+    order_id = session["client_reference_id"]
+    metadata_order_id = metadata["gringotts_order_id"]
     user_id = int(metadata["gringotts_user_id"])
     credits = int(metadata["credits"])
     session_id = session["id"]
     payment_status = session["payment_status"]
     amount_cents = int(session["amount_total"])
+    raw_currency = session["currency"]
+    currency = raw_currency.lower() if isinstance(raw_currency, str) else ""
     payment_intent_id = _expandable_id(session["payment_intent"])
     if (
-        not isinstance(session_id, str)
+        not isinstance(order_id, str)
+        or not order_id
+        or metadata_order_id != order_id
+        or not isinstance(session_id, str)
         or not session_id
         or not isinstance(payment_status, str)
         or not payment_status
         or amount_cents < 0
+        or len(currency) != 3
+        or not currency.isalpha()
         or (amount_cents and not payment_intent_id)
     ):
         raise ValueError("invalid Checkout Session accounting fields")
     return (
+        order_id,
         user_id,
         credits,
         session_id,
         payment_status,
         amount_cents,
+        currency,
         payment_intent_id,
+    )
+
+
+def _checkout_order_marker(session) -> str | None:
+    """Return this library's order marker, or None for unrelated Checkout."""
+    try:
+        reference = session["client_reference_id"]
+    except (KeyError, TypeError):
+        reference = None
+    if isinstance(reference, str) and reference:
+        return reference
+    try:
+        metadata_reference = session["metadata"]["gringotts_order_id"]
+    except (KeyError, TypeError):
+        return None
+    return (
+        metadata_reference
+        if isinstance(metadata_reference, str) and metadata_reference
+        else None
     )
 
 
@@ -163,6 +193,7 @@ def _apply_reversal(
         endpoint=endpoint,
         amount_cents=reversed_cents,
         payment_intent_id=payment_intent,
+        currency=purchase.currency,
     )
 
 
@@ -381,6 +412,7 @@ def _process_dispute(
         external_id=f"{dispute_id}:reinstated",
         amount_cents=-dispute_amount,
         payment_intent_id=payment_intent,
+        currency=purchase.currency,
     )
 
 
@@ -461,6 +493,8 @@ def build_router(config: GringottsConfig) -> APIRouter:
                     "amount": t.amount,
                     "kind": t.kind,
                     "endpoint": t.endpoint,
+                    "amount_cents": t.amount_cents,
+                    "currency": t.currency,
                     "created_at": t.created_at.isoformat(),
                 }
                 for t in transactions
@@ -530,9 +564,23 @@ def build_router(config: GringottsConfig) -> APIRouter:
         user = authenticate(db, api_key)
         if not 0 <= pack < len(config.packs):
             raise HTTPException(status_code=400, detail="Unknown credit pack")
-        session = billing.create_checkout_session(
-            user, config.packs[pack], config, str(request.base_url)
+        selected = config.packs[pack]
+        order = crud.create_checkout_order(
+            db,
+            user,
+            selected.credits,
+            selected.price_cents,
+            selected.currency,
         )
+        session = billing.create_checkout_session(
+            user, selected, config, str(request.base_url), order.id
+        )
+        session_id = getattr(session, "id", None)
+        if not isinstance(session_id, str) or not session_id:
+            raise HTTPException(
+                status_code=502, detail="Stripe returned no Checkout Session ID"
+            )
+        crud.bind_checkout_order(db, order.id, session_id, commit=True)
         if not session.url:
             raise HTTPException(
                 status_code=502, detail="Stripe returned no checkout URL"
@@ -558,13 +606,23 @@ def build_router(config: GringottsConfig) -> APIRouter:
 
         if event["type"] in _FULFILL_EVENTS:
             session = event["data"]["object"]
+            if _checkout_order_marker(session) is None:
+                # The Stripe account may host unrelated Checkout integrations.
+                # A valid Stripe signature alone does not authorize credits.
+                logger.info(
+                    "gringotts webhook %s: unrelated Checkout Session ignored",
+                    event["id"],
+                )
+                return {"received": True}
             try:
                 (
+                    order_id,
                     user_id,
                     credits,
                     session_id,
                     payment_status,
                     amount_cents,
+                    currency,
                     payment_intent_id,
                 ) = _checkout_fields(session)
             except (KeyError, TypeError, ValueError):
@@ -573,11 +631,13 @@ def build_router(config: GringottsConfig) -> APIRouter:
                 )
                 try:
                     (
+                        order_id,
                         user_id,
                         credits,
                         session_id,
                         payment_status,
                         amount_cents,
+                        currency,
                         payment_intent_id,
                     ) = _checkout_fields(session)
                 except (KeyError, TypeError, ValueError):
@@ -590,17 +650,41 @@ def build_router(config: GringottsConfig) -> APIRouter:
                         status_code=503,
                         detail="Checkout data incomplete; retry later",
                     ) from None
-            if credits <= 0:
-                # Our own checkout only ever sets a positive pack size, so a
-                # non-positive value is a corrupt/forged event: log and ack
-                # (do not let it reach grant_credits and 500 into a retry storm).
+            try:
+                order = crud.bind_checkout_order(db, order_id, session_id, commit=False)
+            except ValueError as err:
                 logger.error(
-                    "gringotts webhook %s: non-positive credits=%s in metadata; "
-                    "ignoring",
+                    "gringotts webhook %s: Checkout order %s is bound elsewhere",
                     event["id"],
-                    credits,
+                    order_id,
                 )
-                return {"received": True}
+                raise HTTPException(
+                    status_code=400, detail="Checkout order mismatch"
+                ) from err
+            if order is None:
+                logger.error(
+                    "gringotts webhook %s: Checkout order %s not found",
+                    event["id"],
+                    order_id,
+                )
+                raise HTTPException(
+                    status_code=503, detail="Checkout order not found; retry later"
+                )
+            if (
+                credits != order.credits
+                or user_id != order.user_id
+                or amount_cents != order.amount_cents
+                or currency != order.currency
+            ):
+                db.rollback()
+                logger.error(
+                    "gringotts webhook %s: Checkout Session %s does not match "
+                    "authorized order %s",
+                    event["id"],
+                    session_id,
+                    order_id,
+                )
+                raise HTTPException(status_code=400, detail="Checkout order mismatch")
             if payment_status not in _PAID_STATUSES:
                 # Not settled yet; wait for async_payment_succeeded.
                 logger.info(
@@ -609,7 +693,7 @@ def build_router(config: GringottsConfig) -> APIRouter:
                     payment_status,
                 )
                 return {"received": True}
-            user = crud.get_user(db, user_id)
+            user = crud.get_user(db, order.user_id)
             if user is None:
                 # Usually transient (the user existed when checkout was created;
                 # replica lag or a restore in flight). Return non-2xx so Stripe
@@ -618,31 +702,22 @@ def build_router(config: GringottsConfig) -> APIRouter:
                 logger.error(
                     "gringotts webhook %s: user %s not found; asking Stripe to retry",
                     event["id"],
-                    user_id,
+                    order.user_id,
                 )
                 raise HTTPException(
                     status_code=503, detail="User not found; retry later"
                 )
-            # Databases created before 0.2.0 keyed purchases on the Stripe
-            # event id. If this event was already credited under that scheme,
-            # skip it — otherwise re-keying on the session id would double-credit
-            # a payment when Stripe retries across the upgrade boundary.
-            if crud.external_id_exists(db, event["id"]):
-                logger.info(
-                    "gringotts webhook: event %s already credited (legacy key)",
-                    event["id"],
-                )
-                return {"received": True}
             # Idempotency is keyed on the checkout session, not the event id:
             # Stripe may emit several event objects for one session.
             granted = crud.grant_credits(
                 db,
                 user,
-                credits,
+                order.credits,
                 kind="purchase",
                 external_id=session_id,
                 amount_cents=amount_cents,
                 payment_intent_id=payment_intent_id,
+                currency=order.currency,
             )
             if not granted:
                 logger.info(

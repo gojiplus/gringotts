@@ -69,6 +69,13 @@ class CreditPack:
             raise ValueError("CreditPack.credits must be positive")
         if self.price_cents < 0:
             raise ValueError("CreditPack.price_cents cannot be negative")
+        if (
+            not isinstance(self.currency, str)
+            or len(self.currency) != 3
+            or not self.currency.isalpha()
+        ):
+            raise ValueError("CreditPack.currency must be a three-letter ISO code")
+        object.__setattr__(self, "currency", self.currency.lower())
 
 
 @dataclass
@@ -128,8 +135,8 @@ class GringottsConfig:
         self.stripe_webhook_secret = self.stripe_webhook_secret or os.getenv(
             "STRIPE_WEBHOOK_SECRET"
         )
-        # Revenue is a single smallest-unit total, so mixed currencies would make
-        # it meaningless; require all packs to share one currency.
+        # A single Checkout page offers one currency; historical revenue remains
+        # grouped by the currency stored on each ledger row.
         currencies = {pack.currency.lower() for pack in self.packs}
         if len(currencies) > 1:
             raise ValueError(

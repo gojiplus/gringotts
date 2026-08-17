@@ -5,7 +5,7 @@ invariants it never breaks.
 
 ## The ledger and the balance
 
-Three tables hold everything:
+Four tables hold everything:
 
 - **`users`** — one row per API consumer: the SHA-256 hash of their key (the key
   itself is shown once and never stored), the last four characters for display,
@@ -16,6 +16,9 @@ Three tables hold everything:
   transaction** as the balance update.
 - **`idempotency_records`** — the response cache and lock for keyed requests,
   uniquely indexed by caller and `Idempotency-Key`.
+- **`checkout_orders`** — the exact user, credits, amount, and currency authorized
+  before Stripe Checkout is created. A webhook must match this row exactly before
+  it can grant credits.
 
 So the cached `credits` is a fast read, but the ledger is the source of truth:
 the sum of a user's `amount` values always equals their balance.

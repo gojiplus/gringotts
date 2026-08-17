@@ -2,13 +2,17 @@ import hashlib
 import hmac
 import json
 import time
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from sqlalchemy.orm import sessionmaker
 
 import gringotts
-from gringotts import CreditPack, GringottsConfig, auth, models
+from gringotts import CreditPack, GringottsConfig, auth, crud, models
+from gringotts import db as gdb
+from gringotts.db import Base, make_engine
 
 WEBHOOK_SECRET = "whsec_testsecret"
 
@@ -37,8 +41,18 @@ def sign(payload: bytes, secret: str = WEBHOOK_SECRET) -> str:
 
 
 def checkout_completed_event(
-    user_id: int, credits: int, event_id: str = "evt_1"
+    user_id: int,
+    credits: int,
+    event_id: str = "evt_1",
+    *,
+    order_id: str | None = None,
 ) -> bytes:
+    metadata = {
+        "gringotts_user_id": str(user_id),
+        "credits": str(credits),
+    }
+    if order_id is not None:
+        metadata["gringotts_order_id"] = order_id
     return json.dumps(
         {
             "id": event_id,
@@ -50,16 +64,29 @@ def checkout_completed_event(
                     "id": "cs_test_1",
                     "object": "checkout.session",
                     "amount_total": 500,
+                    "currency": "usd",
                     "payment_status": "paid",
                     "payment_intent": "pi_test_1",
-                    "metadata": {
-                        "gringotts_user_id": str(user_id),
-                        "credits": str(credits),
-                    },
+                    "client_reference_id": order_id,
+                    "metadata": metadata,
                 }
             },
         }
     ).encode()
+
+
+def authorize_checkout(db_session, user_id, *, session_id="cs_test_1"):
+    order = models.CheckoutOrder(
+        id=f"order_{session_id}",
+        stripe_session_id=session_id,
+        user_id=user_id,
+        credits=100,
+        amount_cents=500,
+        currency="usd",
+    )
+    db_session.add(order)
+    db_session.commit()
+    return order.id
 
 
 def test_balance_endpoint(db_session):
@@ -96,7 +123,9 @@ def test_checkout_redirects_to_stripe(db_session, monkeypatch):
 
     def fake_create(**kwargs):
         captured.update(kwargs)
-        return SimpleNamespace(url="https://checkout.stripe.com/c/pay/test")
+        return SimpleNamespace(
+            id="cs_checkout_test", url="https://checkout.stripe.com/c/pay/test"
+        )
 
     monkeypatch.setattr("stripe.checkout.Session.create", fake_create)
 
@@ -105,15 +134,21 @@ def test_checkout_redirects_to_stripe(db_session, monkeypatch):
     assert res.status_code == 303
     assert res.headers["location"] == "https://checkout.stripe.com/c/pay/test"
     assert captured["metadata"]["credits"] == "1000"
+    assert captured["metadata"]["gringotts_order_id"] == captured["client_reference_id"]
     assert captured["mode"] == "payment"
     assert captured["line_items"][0]["price_data"]["unit_amount"] == 4000
+    order = db_session.query(models.CheckoutOrder).one()
+    assert order.stripe_session_id == "cs_checkout_test"
+    assert order.credits == 1000
+    assert order.amount_cents == 4000
+    assert order.currency == "usd"
 
 
 def test_checkout_rejects_bad_key_and_pack(db_session, monkeypatch):
     _, key = auth.create_user_with_key(db_session, "cara", credits=0)
     monkeypatch.setattr(
         "stripe.checkout.Session.create",
-        lambda **kwargs: SimpleNamespace(url="https://example.com"),
+        lambda **kwargs: SimpleNamespace(id="cs_unused", url="https://example.com"),
     )
     client = TestClient(make_app(), follow_redirects=False)
     bad_key = client.post(
@@ -124,9 +159,39 @@ def test_checkout_rejects_bad_key_and_pack(db_session, monkeypatch):
     assert bad_pack.status_code == 400
 
 
+def test_checkout_order_binds_to_only_one_session_concurrently(tmp_path):
+    engine = make_engine(f"sqlite:///{tmp_path}/checkout-bind.db")
+    session_local = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    Base.metadata.create_all(engine)
+    with session_local() as setup:
+        user, _ = auth.create_user_with_key(setup, "bind-race", credits=0)
+        order = crud.create_checkout_order(setup, user, 100, 500, "usd")
+        order_id = order.id
+
+    def bind(session_id):
+        with session_local() as session:
+            try:
+                crud.bind_checkout_order(session, order_id, session_id, commit=True)
+            except ValueError:
+                return False
+            return True
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        outcomes = list(pool.map(bind, ("cs_a", "cs_b")))
+
+    assert sum(outcomes) == 1
+    with session_local() as check:
+        assert check.get(models.CheckoutOrder, order_id).stripe_session_id in {
+            "cs_a",
+            "cs_b",
+        }
+    engine.dispose()
+
+
 def test_webhook_credits_user(db_session):
     user, _ = auth.create_user_with_key(db_session, "dana", credits=0)
-    payload = checkout_completed_event(user.id, 100)
+    order_id = authorize_checkout(db_session, user.id)
+    payload = checkout_completed_event(user.id, 100, order_id=order_id)
     client = TestClient(make_app())
 
     res = client.post(
@@ -143,12 +208,14 @@ def test_webhook_credits_user(db_session):
     assert row.external_id == "cs_test_1"
     assert row.amount == 100
     assert row.amount_cents == 500
+    assert row.currency == "usd"
     assert row.payment_intent_id == "pi_test_1"
 
 
 def test_webhook_is_idempotent(db_session):
     user, _ = auth.create_user_with_key(db_session, "ed", credits=0)
-    payload = checkout_completed_event(user.id, 100)
+    order_id = authorize_checkout(db_session, user.id)
+    payload = checkout_completed_event(user.id, 100, order_id=order_id)
     client = TestClient(make_app())
 
     for _ in range(2):
@@ -167,6 +234,49 @@ def test_webhook_is_idempotent(db_session):
     )
 
 
+def test_same_checkout_session_fulfills_once_under_concurrent_webhooks(
+    tmp_path, monkeypatch
+):
+    engine = make_engine(f"sqlite:///{tmp_path}/checkout-webhook-race.db")
+    session_local = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    Base.metadata.create_all(engine)
+    monkeypatch.setattr(gdb, "SessionLocal", session_local)
+    with session_local() as setup:
+        user, _ = auth.create_user_with_key(setup, "webhook-race", credits=0)
+        order = crud.create_checkout_order(setup, user, 100, 500, "usd")
+        crud.bind_checkout_order(setup, order.id, "cs_test_1", commit=True)
+        user_id = user.id
+        order_id = order.id
+
+    payload = checkout_completed_event(user_id, 100, order_id=order_id)
+    signature = sign(payload)
+
+    def fulfill(_attempt):
+        return (
+            TestClient(make_app())
+            .post(
+                "/gringotts/webhook",
+                content=payload,
+                headers={"stripe-signature": signature},
+            )
+            .status_code
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        statuses = list(pool.map(fulfill, range(2)))
+
+    assert statuses == [200, 200]
+    with session_local() as check:
+        assert check.get(models.User, user_id).credits == 100
+        purchases = (
+            check.query(models.CreditTransaction).filter_by(kind="purchase").all()
+        )
+        assert len(purchases) == 1
+        assert purchases[0].external_id == "cs_test_1"
+        assert purchases[0].balance_after == 100
+    engine.dispose()
+
+
 def test_webhook_rejects_bad_signature(db_session):
     user, _ = auth.create_user_with_key(db_session, "fay", credits=0)
     payload = checkout_completed_event(user.id, 100)
@@ -180,6 +290,44 @@ def test_webhook_rejects_bad_signature(db_session):
     assert res.status_code == 400
     db_session.refresh(user)
     assert user.credits == 0
+
+
+def test_webhook_does_not_fulfill_an_unregistered_checkout(db_session):
+    user, _ = auth.create_user_with_key(db_session, "unbound", credits=0)
+    payload = checkout_completed_event(user.id, 1_000_000)
+
+    response = TestClient(make_app()).post(
+        "/gringotts/webhook",
+        content=payload,
+        headers={"stripe-signature": sign(payload)},
+    )
+    assert response.status_code == 200
+    db_session.refresh(user)
+    assert user.credits == 0
+    assert (
+        db_session.query(models.CreditTransaction).filter_by(kind="purchase").count()
+        == 0
+    )
+
+
+def test_webhook_rejects_checkout_that_disagrees_with_authorized_order(db_session):
+    user, _ = auth.create_user_with_key(db_session, "mismatch", credits=0)
+    order_id = authorize_checkout(db_session, user.id)
+    payload = checkout_completed_event(user.id, 1_000_000, order_id=order_id)
+
+    response = TestClient(make_app()).post(
+        "/gringotts/webhook",
+        content=payload,
+        headers={"stripe-signature": sign(payload)},
+    )
+
+    assert response.status_code == 400
+    db_session.refresh(user)
+    assert user.credits == 0
+    assert (
+        db_session.query(models.CreditTransaction).filter_by(kind="purchase").count()
+        == 0
+    )
 
 
 def test_webhook_ignores_other_events(db_session):

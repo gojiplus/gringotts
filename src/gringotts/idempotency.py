@@ -20,9 +20,9 @@ Design choices (documented, not incidental):
   request passes through to the app's own ``401`` (which is not cached).
 - **Scope is the caller** (SHA-256 of the ``X-API-Key``), so one caller can never
   replay another caller's key.
-- **A fingerprint** (method + path + query + body) guards the key: reusing it for
-  a materially different request returns ``409`` rather than the wrong cached
-  response.
+- **A fingerprint** (method + path + query + every request header + body) guards
+  the key: changing authorization, pricing, content, or any other input returns
+  ``409`` rather than replaying a response produced for different input.
 - **Complete compensation releases the key; a committed charge keeps it.** gringotts
   charges *before* the handler runs, and ``Depends(charge())`` compensates on a
   raised exception. The key is released only after every charge from the request has
@@ -90,7 +90,13 @@ _MARKER_BODY = json.dumps(
 ).encode()
 
 
-def _fingerprint(method: str, path: str, query: bytes, body: bytes) -> str:
+def _fingerprint(
+    method: str,
+    path: str,
+    query: bytes,
+    body: bytes,
+    headers: list[tuple[bytes, bytes]] | None = None,
+) -> str:
     """SHA-256 over the parts of a request that define its identity.
 
     Each part is length-prefixed so the encoding is injective — a separator byte
@@ -99,7 +105,12 @@ def _fingerprint(method: str, path: str, query: bytes, body: bytes) -> str:
     deduplicated.
     """
     digest = hashlib.sha256()
-    for part in (method.encode(), path.encode(), query, body):
+    parts = [method.encode(), path.encode(), query, body]
+    request_headers = headers or []
+    parts.append(len(request_headers).to_bytes(8, "big"))
+    for name, value in request_headers:
+        parts.extend((name.lower(), value))
+    for part in parts:
         digest.update(len(part).to_bytes(8, "big"))
         digest.update(part)
     return digest.hexdigest()
@@ -183,8 +194,21 @@ class IdempotencyMiddleware:
             await self._send(send, 413, _BODY_TOO_LARGE_BODY, _JSON)
             return
 
+        # Any request header can affect authentication, pricing, or handler output.
+        # Bind all of them except the idempotency key itself into the operation
+        # fingerprint so a changed Authorization/Cookie/custom header conflicts
+        # instead of replaying a response produced for different input.
+        fingerprint_headers = [
+            (name, value)
+            for name, value in scope["headers"]
+            if name.lower() != self.header
+        ]
         fingerprint = _fingerprint(
-            scope["method"], scope["path"], scope.get("query_string", b""), body
+            scope["method"],
+            scope["path"],
+            scope.get("query_string", b""),
+            body,
+            fingerprint_headers,
         )
         outcome, claim, stored = await run_in_threadpool(
             self._claim, api_key_hash, key, fingerprint

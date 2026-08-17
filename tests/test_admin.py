@@ -64,7 +64,13 @@ def test_admin_users_list_and_stats(db_session):
     client = TestClient(make_app())
     client.get("/hello", headers={"X-API-Key": key})
     crud.grant_credits(
-        db_session, user, 100, kind="purchase", external_id="evt_a", amount_cents=500
+        db_session,
+        user,
+        100,
+        kind="purchase",
+        external_id="evt_a",
+        amount_cents=500,
+        currency="usd",
     )
 
     users = client.get(
@@ -82,7 +88,7 @@ def test_admin_users_list_and_stats(db_session):
     assert stats["credits_outstanding"] == 108
     assert stats["credits_consumed"] == 2
     assert stats["credits_purchased"] == 100
-    assert stats["revenue_cents"] == 500
+    assert stats["revenue_by_currency"] == {"usd": 500}
 
 
 def test_admin_create_user_key_works_immediately(db_session):

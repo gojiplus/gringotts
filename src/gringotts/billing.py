@@ -7,12 +7,17 @@ from .models import User
 
 
 def create_checkout_session(
-    user: User, pack: CreditPack, config: GringottsConfig, base_url: str
+    user: User,
+    pack: CreditPack,
+    config: GringottsConfig,
+    base_url: str,
+    order_id: str,
 ) -> stripe.checkout.Session:
     """Create a one-time Stripe Checkout session for a credit pack.
 
-    Uses inline price_data so no Stripe Dashboard product setup is needed; the
-    metadata carries everything the webhook needs to credit the right user.
+    Uses inline price_data so no Stripe Dashboard product setup is needed. The
+    local order is the entitlement source of truth; Stripe receives its opaque
+    ID only so the webhook can reconcile the paid Session back to that order.
     """
     buy_url = f"{base_url}{config.mount_path.lstrip('/')}/buy"
     return stripe.checkout.Session.create(
@@ -30,8 +35,18 @@ def create_checkout_session(
         ],
         success_url=config.success_url or f"{buy_url}?status=success",
         cancel_url=config.cancel_url or f"{buy_url}?status=cancelled",
-        metadata={"gringotts_user_id": str(user.id), "credits": str(pack.credits)},
+        client_reference_id=order_id,
+        metadata={
+            "gringotts_order_id": order_id,
+            "gringotts_user_id": str(user.id),
+            "credits": str(pack.credits),
+        },
         # copied onto the PaymentIntent and its Charge, so refund/dispute events
         # carry the user id even without the checkout session
-        payment_intent_data={"metadata": {"gringotts_user_id": str(user.id)}},
+        payment_intent_data={
+            "metadata": {
+                "gringotts_order_id": order_id,
+                "gringotts_user_id": str(user.id),
+            }
+        },
     )

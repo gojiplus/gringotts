@@ -20,8 +20,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   handler for free, or race the original's refund.
   - Keys are **scoped to the caller** (the API key), so one caller can't replay
     another's key.
-  - Reusing a key for a materially different request (method, path, or body) returns
-    `409 Conflict`; a replay carries an `Idempotent-Replayed: true` header.
+  - Reusing a key for a materially different request (method, path, headers, or
+    body) returns `409 Conflict`; a replay carries an `Idempotent-Replayed: true`
+    header. Binding all headers prevents a changed authorization or pricing header
+    from replaying another operation's response.
   - A raised error whose charge was **successfully refunded** releases the key, so
     a genuine retry can re-attempt. A returned response—including a returned
     `5xx`—is cached because its charge remains committed. If compensation fails,
@@ -86,6 +88,11 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   event snapshot. When an immutable refund event omits its settlement status,
   Gringotts retrieves the current Refund from Stripe instead of retrying that same
   incomplete snapshot forever.
+- Stripe fulfillment is bound to a locally persisted Checkout order. A signed event
+  from another Checkout integration—or one whose user, credits, amount, or currency
+  differs from the authorized order—cannot mint credits.
+- Purchase and reversal rows store their ISO currency, and revenue is aggregated by
+  currency instead of silently adding incompatible minor units.
 
 ### Removed
 
@@ -96,7 +103,11 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Upgrading
 
-- Run `gringotts migrate` to create the `idempotency_records` table.
+- Run `gringotts migrate` to create the `idempotency_records` and
+  `checkout_orders` tables and add the ledger currency column. Historical monetary
+  rows have unknown currency; new revenue is reported separately by ISO currency.
+- Drain Checkout Sessions created by 0.3.x before upgrading. Version 0.4.0 fulfills
+  only Sessions tied to a locally persisted `checkout_orders` row.
 
 ## [0.3.0] - 2026-08-15
 

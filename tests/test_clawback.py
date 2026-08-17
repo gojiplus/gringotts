@@ -76,7 +76,9 @@ def _client():
     return TestClient(make_app())
 
 
-def _purchase_event(user_id, credits, pi, session_id="cs_p", event_id="evt_p"):
+def _purchase_event(
+    user_id, credits, pi, order_id, session_id="cs_p", event_id="evt_p"
+):
     return json.dumps(
         {
             "id": event_id,
@@ -88,9 +90,12 @@ def _purchase_event(user_id, credits, pi, session_id="cs_p", event_id="evt_p"):
                     "id": session_id,
                     "object": "checkout.session",
                     "amount_total": 500,
+                    "currency": "usd",
                     "payment_status": "paid",
                     "payment_intent": pi,
+                    "client_reference_id": order_id,
                     "metadata": {
+                        "gringotts_order_id": order_id,
                         "gringotts_user_id": str(user_id),
                         "credits": str(credits),
                     },
@@ -147,7 +152,20 @@ def _post(client, payload):
 
 def _buy(db, client, name, credits=100, pi="pi_1"):
     user, _ = auth.create_user_with_key(db, name, credits=0)
-    assert _post(client, _purchase_event(user.id, credits, pi)).status_code == 200
+    order = models.CheckoutOrder(
+        id=f"order_{pi}",
+        stripe_session_id="cs_p",
+        user_id=user.id,
+        credits=credits,
+        amount_cents=500,
+        currency="usd",
+    )
+    db.add(order)
+    db.commit()
+    assert (
+        _post(client, _purchase_event(user.id, credits, pi, order.id)).status_code
+        == 200
+    )
     db.refresh(user)
     assert user.credits == credits
     return user
@@ -159,6 +177,7 @@ def test_purchase_stores_payment_intent(db_session):
     assert row.payment_intent_id == "pi_1"
     assert row.amount == 100
     assert row.amount_cents == 500
+    assert row.currency == "usd"
 
 
 def test_proportional_rounding_is_exact_above_float_precision():
@@ -260,6 +279,16 @@ def test_multiple_partial_refunds_do_not_over_claw(db_session):
     # claw 2+2+2=6; cumulative delta math caps the total at 5.
     client = _client()
     user, _ = auth.create_user_with_key(db_session, "p8", credits=0)
+    order = models.CheckoutOrder(
+        id="order_small",
+        stripe_session_id="cs_small",
+        user_id=user.id,
+        credits=5,
+        amount_cents=3,
+        currency="usd",
+    )
+    db_session.add(order)
+    db_session.commit()
     payload = json.dumps(
         {
             "id": "evt_small",
@@ -270,9 +299,15 @@ def test_multiple_partial_refunds_do_not_over_claw(db_session):
                     "id": "cs_small",
                     "object": "checkout.session",
                     "amount_total": 3,
+                    "currency": "usd",
                     "payment_status": "paid",
                     "payment_intent": "pi_small",
-                    "metadata": {"gringotts_user_id": str(user.id), "credits": "5"},
+                    "client_reference_id": order.id,
+                    "metadata": {
+                        "gringotts_order_id": order.id,
+                        "gringotts_user_id": str(user.id),
+                        "credits": "5",
+                    },
                 }
             },
         }
@@ -533,9 +568,9 @@ def test_stats_net_clawbacks_from_purchased_and_revenue(db_session):
     user = _buy(db_session, client, "pc")  # purchased 100 for 500 cents
     stats = crud.aggregate_stats(db_session)
     assert stats["credits_purchased"] == 100
-    assert stats["revenue_cents"] == 500
+    assert stats["revenue_by_currency"] == {"usd": 500}
     _post(client, _refund_event("pi_1", 500))  # full refund
     db_session.refresh(user)
     stats = crud.aggregate_stats(db_session)
     assert stats["credits_purchased"] == 0  # credits netted
-    assert stats["revenue_cents"] == 0  # revenue netted
+    assert stats["revenue_by_currency"] == {"usd": 0}  # revenue netted

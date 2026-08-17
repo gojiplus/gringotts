@@ -189,12 +189,25 @@ def test_c5_grant_credits_rejects_negative(db_session):
 
 
 # ---- C2 / C3 / C6: webhook trust boundary ----------------------------------
-def _event(user_id, credits, event_id, session_id, payment_status="paid"):
+def _event(
+    user_id,
+    credits,
+    event_id,
+    session_id,
+    payment_status="paid",
+    *,
+    order_id=None,
+):
+    metadata = {"gringotts_user_id": str(user_id), "credits": str(credits)}
+    if order_id is not None:
+        metadata["gringotts_order_id"] = order_id
     obj = {
         "id": session_id,
         "object": "checkout.session",
         "amount_total": 500,
-        "metadata": {"gringotts_user_id": str(user_id), "credits": str(credits)},
+        "currency": "usd",
+        "client_reference_id": order_id,
+        "metadata": metadata,
         "payment_intent": f"pi_{session_id}",
     }
     if payment_status is not None:
@@ -210,6 +223,20 @@ def _event(user_id, credits, event_id, session_id, payment_status="paid"):
     ).encode()
 
 
+def _authorize_checkout(db_session, user_id, session_id, credits=100):
+    order = models.CheckoutOrder(
+        id=f"order_{session_id}",
+        stripe_session_id=session_id,
+        user_id=user_id,
+        credits=credits,
+        amount_cents=500,
+        currency="usd",
+    )
+    db_session.add(order)
+    db_session.commit()
+    return order.id
+
+
 def _post(client, payload):
     return client.post(
         "/gringotts/webhook",
@@ -220,7 +247,15 @@ def _post(client, payload):
 
 def test_c2_unpaid_session_not_credited(db_session):
     user, _ = auth.create_user_with_key(db_session, "async", credits=0)
-    payload = _event(user.id, 100, "evt_u", "cs_u", payment_status="unpaid")
+    order_id = _authorize_checkout(db_session, user.id, "cs_u")
+    payload = _event(
+        user.id,
+        100,
+        "evt_u",
+        "cs_u",
+        payment_status="unpaid",
+        order_id=order_id,
+    )
     assert _post(TestClient(make_stripe_app()), payload).status_code == 200
     db_session.refresh(user)
     assert user.credits == 0
@@ -230,8 +265,21 @@ def test_c2_unpaid_session_not_credited(db_session):
 def test_c3_duplicate_events_one_session_credit_once(db_session):
     user, _ = auth.create_user_with_key(db_session, "buyer", credits=0)
     client = TestClient(make_stripe_app())
-    assert _post(client, _event(user.id, 100, "evt_A", "cs_same")).status_code == 200
-    assert _post(client, _event(user.id, 100, "evt_B", "cs_same")).status_code == 200
+    order_id = _authorize_checkout(db_session, user.id, "cs_same")
+    assert (
+        _post(
+            client,
+            _event(user.id, 100, "evt_A", "cs_same", order_id=order_id),
+        ).status_code
+        == 200
+    )
+    assert (
+        _post(
+            client,
+            _event(user.id, 100, "evt_B", "cs_same", order_id=order_id),
+        ).status_code
+        == 200
+    )
     db_session.refresh(user)
     assert user.credits == 100  # one session -> credited once
     assert (
@@ -243,13 +291,20 @@ def test_c3_duplicate_events_one_session_credit_once(db_session):
 def test_c2_async_succeeded_credits(db_session):
     """The settlement event for a delayed payment does credit."""
     user, _ = auth.create_user_with_key(db_session, "ach", credits=0)
+    order_id = _authorize_checkout(db_session, user.id, "cs_ach")
     obj = {
         "id": "cs_ach",
         "object": "checkout.session",
         "amount_total": 500,
+        "currency": "usd",
         "payment_status": "paid",
         "payment_intent": "pi_ach",
-        "metadata": {"gringotts_user_id": str(user.id), "credits": "100"},
+        "client_reference_id": order_id,
+        "metadata": {
+            "gringotts_order_id": order_id,
+            "gringotts_user_id": str(user.id),
+            "credits": "100",
+        },
     }
     payload = json.dumps(
         {
@@ -266,23 +321,44 @@ def test_c2_async_succeeded_credits(db_session):
 
 
 @pytest.mark.parametrize(
-    "missing", ["metadata", "payment_status", "amount_total", "payment_intent"]
+    "missing",
+    [
+        "metadata",
+        "client_reference_id",
+        "payment_status",
+        "amount_total",
+        "currency",
+        "payment_intent",
+    ],
 )
 def test_incomplete_checkout_retrieves_current_session(
     db_session, monkeypatch, missing
 ):
     user, _ = auth.create_user_with_key(db_session, f"missing-{missing}", credits=0)
+    order_id = _authorize_checkout(db_session, user.id, f"cs_{missing}")
     payload = json.loads(
-        _event(user.id, 100, f"evt_{missing}", f"cs_{missing}").decode()
+        _event(
+            user.id,
+            100,
+            f"evt_{missing}",
+            f"cs_{missing}",
+            order_id=order_id,
+        ).decode()
     )
     del payload["data"]["object"][missing]
 
     def retrieve(session_id, *, api_key):
         assert session_id == f"cs_{missing}"
         assert api_key == "sk_test_x"
-        return json.loads(_event(user.id, 100, "evt_current", session_id).decode())[
-            "data"
-        ]["object"]
+        return json.loads(
+            _event(
+                user.id,
+                100,
+                "evt_current",
+                session_id,
+                order_id=order_id,
+            ).decode()
+        )["data"]["object"]
 
     monkeypatch.setattr("stripe.checkout.Session.retrieve", retrieve)
     response = _post(TestClient(make_stripe_app()), json.dumps(payload).encode())
@@ -294,7 +370,10 @@ def test_incomplete_checkout_retrieves_current_session(
 
 def test_incomplete_checkout_after_retrieval_asks_retry(db_session, monkeypatch):
     user, _ = auth.create_user_with_key(db_session, "still-incomplete", credits=0)
-    payload = json.loads(_event(user.id, 100, "evt_bad", "cs_bad").decode())
+    order_id = _authorize_checkout(db_session, user.id, "cs_bad")
+    payload = json.loads(
+        _event(user.id, 100, "evt_bad", "cs_bad", order_id=order_id).decode()
+    )
     del payload["data"]["object"]["payment_status"]
     monkeypatch.setattr(
         "stripe.checkout.Session.retrieve",
@@ -308,10 +387,14 @@ def test_incomplete_checkout_after_retrieval_asks_retry(db_session, monkeypatch)
     assert db_session.query(models.CreditTransaction).count() == 0
 
 
-def test_c6_unknown_user_asks_stripe_to_retry(db_session, caplog):
-    # A paid event for a missing user must NOT be silently 200'd (that drops the
-    # payment forever); return non-2xx so Stripe retries the transient case.
-    payload = _event(999999, 100, "evt_ghost", "cs_ghost")
+def test_c6_unknown_order_asks_stripe_to_retry(db_session, caplog):
+    payload = _event(
+        999999,
+        100,
+        "evt_ghost",
+        "cs_ghost",
+        order_id="order_missing",
+    )
     with caplog.at_level("ERROR", logger="gringotts.router"):
         assert _post(TestClient(make_stripe_app()), payload).status_code == 503
     assert db_session.query(models.CreditTransaction).count() == 0

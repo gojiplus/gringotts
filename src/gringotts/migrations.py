@@ -123,10 +123,26 @@ def _add_idempotency_records(conn) -> None:
     Base.metadata.tables["idempotency_records"].create(bind=conn, checkfirst=True)
 
 
+def _add_transaction_currency(conn) -> None:
+    if not _has_column(conn, "credit_transactions", "currency"):
+        conn.execute(
+            text("ALTER TABLE credit_transactions ADD COLUMN currency VARCHAR(3)")
+        )
+
+
+def _add_checkout_orders(conn) -> None:
+    from .db import Base
+    from .models import CheckoutOrder  # noqa: F401 - registers the table
+
+    Base.metadata.tables["checkout_orders"].create(bind=conn, checkfirst=True)
+
+
 STEPS: list[tuple[int, str, Callable]] = [
     (1, "add balance_after running-balance to credit_transactions", _add_balance_after),
     (2, "add payment_intent_id to credit_transactions", _add_payment_intent_id),
     (3, "add the idempotency_records response-cache table", _add_idempotency_records),
+    (4, "add ISO currency to monetary ledger rows", _add_transaction_currency),
+    (5, "add locally authorized Stripe Checkout orders", _add_checkout_orders),
 ]
 
 HEAD = STEPS[-1][0] if STEPS else 0

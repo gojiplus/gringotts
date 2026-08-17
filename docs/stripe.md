@@ -45,9 +45,12 @@ signature is rejected with `400`.
 ## Crediting
 
 Credits are granted only once the checkout session's `payment_status` is `paid`
-(or `no_payment_required`). Idempotency is keyed on the **checkout session id**,
-so Stripe re-delivering an event — or sending more than one event for the same
-session — never double-credits.
+(or `no_payment_required`). Before redirecting the buyer, Gringotts persists the
+authorized user, credits, amount, and currency in `checkout_orders`. Fulfillment
+requires the signed Session to match that local order exactly; unrelated Checkout
+integrations on the same Stripe account are ignored. Idempotency is keyed on the
+**checkout session id**, so Stripe re-delivering an event—or sending more than one
+event for the same session—never double-credits.
 
 ## Clawback (refunds and disputes)
 
@@ -69,6 +72,8 @@ When a payment is reversed, gringotts reverses the credits it granted:
 `price_cents` is the amount in the currency's *smallest unit*. For zero-decimal
 currencies (JPY, KRW, and others), that unit is the whole currency — `price_cents=500`
 means ¥500, not ¥5.00 — and gringotts displays it accordingly.
+Purchase, refund, dispute, and reinstatement rows retain the ISO currency, so
+historical revenue is totaled separately per currency.
 
 ## Local testing
 
@@ -76,9 +81,11 @@ means ¥500, not ¥5.00 — and gringotts displays it accordingly.
 stripe listen --forward-to localhost:8000/gringotts/webhook
 ```
 
-## Upgrading from 0.1.x / 0.2.x
+## Upgrading
 
-Run `gringotts migrate` after upgrading. Two caveats the tool warns about:
+Run `gringotts migrate` after upgrading. Drain Checkout Sessions created by 0.3.x
+before moving to 0.4.0; the new release fulfills only Sessions backed by a local
+`checkout_orders` row. Two older caveats remain:
 
 - Purchases recorded by **0.1.x** were keyed on the Stripe event id, not the
   checkout session. Drain any in-flight delayed payments before upgrading so a

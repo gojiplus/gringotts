@@ -63,6 +63,9 @@ class CreditTransaction(Base):
     endpoint: Mapped[str | None] = mapped_column(String, default=None)
     # money actually paid, set only on purchase rows (Checkout amount_total)
     amount_cents: Mapped[int | None] = mapped_column(default=None)
+    # ISO currency for every purchase/reversal money amount. Historical rows
+    # migrated from older releases remain NULL and are reported as unknown.
+    currency: Mapped[str | None] = mapped_column(String(3), default=None)
     # Stripe PaymentIntent id, set on purchase rows; lets refund/dispute events
     # (which carry payment_intent, not the checkout session) find this purchase
     payment_intent_id: Mapped[str | None] = mapped_column(
@@ -75,6 +78,29 @@ class CreditTransaction(Base):
     user: Mapped[User] = relationship(back_populates="transactions")
 
 
+class CheckoutOrder(Base):
+    """Locally authorized Stripe Checkout order awaiting fulfillment.
+
+    The webhook grants only an exact match to one of these rows. This binds a
+    Stripe Session to the user, credits, amount, and currency approved by the
+    application before redirecting the buyer to Stripe.
+    """
+
+    __tablename__ = "checkout_orders"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    stripe_session_id: Mapped[str | None] = mapped_column(
+        String, unique=True, index=True, default=None
+    )
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    credits: Mapped[int]
+    amount_cents: Mapped[int]
+    currency: Mapped[str] = mapped_column(String(3))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(UTC)
+    )
+
+
 class IdempotencyRecord(Base):
     """A stored HTTP response, keyed by caller and Idempotency-Key.
 
@@ -84,7 +110,7 @@ class IdempotencyRecord(Base):
     a non-cacheable body) without re-running the handler — so a retried charge or
     grant applies exactly once. Scoped by ``api_key_hash`` (the caller), so one
     caller can never replay another's key. ``request_fingerprint`` guards against
-    reusing a key for a materially different request (method, path, or body),
+    reusing a key for a materially different request (method, path, headers, or body),
     which returns a 409.
     """
 
@@ -105,7 +131,7 @@ class IdempotencyRecord(Base):
     # key, and scopes idempotency keys per caller
     api_key_hash: Mapped[str] = mapped_column(String, index=True)
     idempotency_key: Mapped[str] = mapped_column(String)
-    # SHA-256 of method + path + query + body; a mismatch on replay is a 409
+    # SHA-256 of method + path + query + headers + body; a mismatch is a 409
     request_fingerprint: Mapped[str] = mapped_column(String)
     # False while the first request is in flight; True once its response is stored
     completed: Mapped[bool] = mapped_column(default=False)
