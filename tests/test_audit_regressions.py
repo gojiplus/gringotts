@@ -259,13 +259,42 @@ def test_c2_async_succeeded_credits(db_session):
     assert user.credits == 100
 
 
-@pytest.mark.parametrize("missing", ["amount_total", "payment_intent"])
-def test_paid_checkout_with_incomplete_accounting_data_asks_retry(db_session, missing):
+@pytest.mark.parametrize(
+    "missing", ["metadata", "payment_status", "amount_total", "payment_intent"]
+)
+def test_incomplete_checkout_retrieves_current_session(
+    db_session, monkeypatch, missing
+):
     user, _ = auth.create_user_with_key(db_session, f"missing-{missing}", credits=0)
     payload = json.loads(
         _event(user.id, 100, f"evt_{missing}", f"cs_{missing}").decode()
     )
     del payload["data"]["object"][missing]
+
+    def retrieve(session_id, *, api_key):
+        assert session_id == f"cs_{missing}"
+        assert api_key == "sk_test_x"
+        return json.loads(_event(user.id, 100, "evt_current", session_id).decode())[
+            "data"
+        ]["object"]
+
+    monkeypatch.setattr("stripe.checkout.Session.retrieve", retrieve)
+    response = _post(TestClient(make_stripe_app()), json.dumps(payload).encode())
+    assert response.status_code == 200
+    db_session.refresh(user)
+    assert user.credits == 100
+    assert db_session.query(models.CreditTransaction).count() == 1
+
+
+def test_incomplete_checkout_after_retrieval_asks_retry(db_session, monkeypatch):
+    user, _ = auth.create_user_with_key(db_session, "still-incomplete", credits=0)
+    payload = json.loads(_event(user.id, 100, "evt_bad", "cs_bad").decode())
+    del payload["data"]["object"]["payment_status"]
+    monkeypatch.setattr(
+        "stripe.checkout.Session.retrieve",
+        lambda *args, **kwargs: payload["data"]["object"],
+    )
+
     response = _post(TestClient(make_stripe_app()), json.dumps(payload).encode())
     assert response.status_code == 503
     db_session.refresh(user)

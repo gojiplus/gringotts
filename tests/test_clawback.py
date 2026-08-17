@@ -9,6 +9,7 @@ from sqlalchemy.orm import sessionmaker
 from test_router import WEBHOOK_SECRET, make_app, sign
 
 from gringotts import auth, crud, models
+from gringotts import db as gdb
 from gringotts.db import Base, make_engine
 from gringotts.router import _round_proportional
 
@@ -341,6 +342,56 @@ def test_refund_still_missing_status_after_retrieval_asks_retry(
     assert user.credits == 100
 
 
+def test_refund_missing_accounting_field_retrieves_current_object(
+    db_session, monkeypatch
+):
+    client = _client()
+    user = _buy(db_session, client, "p_missing_amount")
+    refund = json.loads(_refund_event("pi_1", 500).decode())
+    del refund["data"]["object"]["amount"]
+
+    monkeypatch.setattr(
+        "stripe.Refund.retrieve",
+        lambda *args, **kwargs: {
+            "id": "re_1",
+            "object": "refund",
+            "payment_intent": "pi_1",
+            "amount": 500,
+            "status": "succeeded",
+        },
+    )
+
+    assert _post(client, json.dumps(refund).encode()).status_code == 200
+    db_session.refresh(user)
+    assert user.credits == 0
+
+
+def test_dispute_missing_accounting_field_retrieves_current_object(
+    db_session, monkeypatch
+):
+    client = _client()
+    user = _buy(db_session, client, "p_missing_dispute_amount")
+    dispute = json.loads(
+        _dispute_event("pi_1", "charge.dispute.funds_withdrawn").decode()
+    )
+    del dispute["data"]["object"]["amount"]
+
+    def retrieve(dispute_id, *, api_key):
+        assert dispute_id == "du_1"
+        assert api_key == "sk_test_x"
+        return {
+            "id": dispute_id,
+            "object": "dispute",
+            "payment_intent": "pi_1",
+            "amount": 500,
+        }
+
+    monkeypatch.setattr("stripe.Dispute.retrieve", retrieve)
+    assert _post(client, json.dumps(dispute).encode()).status_code == 200
+    db_session.refresh(user)
+    assert user.credits == 0
+
+
 def test_dispute_is_proportional_after_partial_refund(db_session):
     client = _client()
     user = _buy(db_session, client, "pa")  # 100 credits for 500 cents
@@ -383,6 +434,63 @@ def test_refund_after_reinstated_dispute_claws_correctly(db_session):
     db_session.refresh(user)
     assert user.credits == 50  # proportional claw, not under-clawed to 100
     assert crud.find_balance_discrepancies(db_session) == []
+
+
+def test_refund_before_dispute_reinstatement_remains_clawed(db_session):
+    client = _client()
+    user = _buy(db_session, client, "pr")  # 100 credits / 500 cents
+    _post(client, _dispute_event("pi_1", "charge.dispute.funds_withdrawn"))
+    _post(client, _refund_event("pi_1", 250))
+    _post(client, _dispute_event("pi_1", "charge.dispute.funds_reinstated"))
+
+    db_session.refresh(user)
+    assert user.credits == 50
+    assert crud.find_balance_discrepancies(db_session) == []
+
+
+def test_concurrent_refund_and_dispute_reinstatement_are_order_independent(
+    tmp_path, monkeypatch
+):
+    url = os.getenv("GRINGOTTS_TEST_DATABASE_URL") or f"sqlite:///{tmp_path}/race.db"
+    engine = make_engine(url)
+    session_local = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    Base.metadata.drop_all(bind=engine)
+    Base.metadata.create_all(bind=engine)
+    monkeypatch.setattr(gdb, "SessionLocal", session_local)
+
+    with session_local() as setup:
+        user = _buy(setup, _client(), "concurrent", pi="pi_concurrent")
+        user_id = user.id
+        withdrawn = _dispute_event(
+            "pi_concurrent",
+            "charge.dispute.funds_withdrawn",
+            dispute_id="du_concurrent",
+            event_id="evt_withdrawn",
+        )
+        assert _post(_client(), withdrawn).status_code == 200
+
+    refund = _refund_event(
+        "pi_concurrent", 250, refund_id="re_concurrent", event_id="evt_refund"
+    )
+    reinstated = _dispute_event(
+        "pi_concurrent",
+        "charge.dispute.funds_reinstated",
+        dispute_id="du_concurrent",
+        event_id="evt_reinstated",
+    )
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        statuses = list(
+            pool.map(
+                lambda payload: _post(_client(), payload).status_code,
+                (refund, reinstated),
+            )
+        )
+
+    assert statuses == [200, 200]
+    with session_local() as check:
+        assert crud.get_user(check, user_id).credits == 50
+        assert crud.find_balance_discrepancies(check) == []
+    engine.dispose()
 
 
 def test_null_payment_intent_does_not_claw_unrelated_user(db_session):

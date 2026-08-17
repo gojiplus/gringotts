@@ -237,16 +237,6 @@ def lock_user(db: Session, user_id: int) -> models.User | None:
     return db.get(models.User, user_id)
 
 
-def clawback_deducted(db: Session, external_id: str) -> int:
-    """The credits a prior clawback row actually deducted (absolute value)."""
-    row = (
-        db.query(models.CreditTransaction.amount)
-        .filter(models.CreditTransaction.external_id == external_id)
-        .first()
-    )
-    return -int(row[0]) if row is not None else 0
-
-
 def clawback_totals(db: Session, payment_intent_id: str) -> tuple[int, int]:
     """Cumulative (reversed cents, credits clawed) for a purchase's clawbacks.
 

@@ -59,6 +59,11 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - A failed compensating refund no longer releases an idempotency key and permits a
   second debit; when a request has multiple charges, every debit must have an exact
   confirmed refund before the request becomes retryable.
+- FastAPI 0.118.0 or newer is required so `charge()` can observe streaming and
+  background-task failures and compensate their debits before releasing a key.
+- SQLAlchemy 2.0.44 or newer is required for supported Python 3.13 and 3.14
+  runtimes; CI now executes the full suite against the runtime and test dependency
+  lower bounds.
 - Concurrent first attempts are serialized by the caller/key claim, and stale
   requests cannot mutate a newer claim after emergency in-flight pruning and
   primary-key reuse.
@@ -68,7 +73,11 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Pruning an expired completed record concurrently with lazy key reclamation no
   longer produces a spurious in-progress conflict.
 - Proportional Stripe clawbacks use exact integer rounding rather than floats, so
-  large credit balances cannot be over- or under-clawed through precision loss.
+  large credit balances cannot be over- or under-clawed through precision loss, and
+  dispute reinstatements preserve intervening refunds regardless of event order.
+- Incomplete immutable Stripe webhook snapshots now retrieve their current Checkout
+  Session, Refund, or Dispute before accounting instead of dropping a payment or
+  retrying an event whose contents cannot change.
 - Credit movements and pack prices reject fractional, string, and Boolean quantities
   at runtime so SQLite, dynamic pricing, and Checkout configuration cannot admit
   non-integers into the ledger or payment flow.
