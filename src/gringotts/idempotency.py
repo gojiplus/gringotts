@@ -18,8 +18,8 @@ Design choices (documented, not incidental):
 - **Only authenticated callers create records.** The API key is validated before
   any row is inserted, so an unauthenticated client can't fill the table; its
   request passes through to the app's own ``401`` (which is not cached).
-- **Scope is the caller** (SHA-256 of the ``X-API-Key``), so one caller can never
-  replay another caller's key.
+- **Scope is the caller** (SHA-256 of the ``X-API-Key``, or the built-in Checkout
+  form's API key), so one caller can never replay another caller's key.
 - **A fingerprint** (method + path + query + every request header + body) guards
   the key: changing authorization, pricing, content, or any other input returns
   ``409`` rather than replaying a response produced for different input.
@@ -64,7 +64,7 @@ Limitations (deliberate trade-offs for a money library):
 import hashlib
 import json
 from datetime import UTC, datetime
-from urllib.parse import unquote, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 from sqlalchemy.exc import IntegrityError
 from starlette.concurrency import run_in_threadpool
@@ -82,6 +82,9 @@ _IN_PROGRESS_BODY = json.dumps(
 _KEY_TOO_LONG_BODY = json.dumps({"detail": "Idempotency-Key is too long"}).encode()
 _BODY_TOO_LARGE_BODY = json.dumps(
     {"detail": "Request body too large for an idempotent request"}
+).encode()
+_CHECKOUT_FORM_BODY = json.dumps(
+    {"detail": "A keyed Checkout request requires a URL-encoded api_key form field"}
 ).encode()
 # Stored for a request whose response was too large to cache: the charge already
 # happened once, so a replay must return this (keeping the key locked) rather than
@@ -138,6 +141,7 @@ class IdempotencyMiddleware:
         max_body_bytes: int = 1_000_000,
         max_response_bytes: int = 1_000_000,
         retention_seconds: float = 86_400.0,
+        form_api_key_path: str | None = None,
     ) -> None:
         """Wrap `app`, reading `header` and honoring the size and age limits."""
         self.app = app
@@ -147,6 +151,7 @@ class IdempotencyMiddleware:
         self.max_body_bytes = max_body_bytes
         self.max_response_bytes = max_response_bytes
         self.retention_seconds = retention_seconds
+        self.form_api_key_path = form_api_key_path
 
     async def __call__(self, scope, receive, send) -> None:
         """Intercept a keyed HTTP request; otherwise pass straight through."""
@@ -165,8 +170,7 @@ class IdempotencyMiddleware:
                 raw_key = value
             elif lname == self.api_key_header and raw_api_key is None:
                 raw_api_key = value
-        # No key, or no caller to scope it to → not our concern.
-        if not raw_key or not raw_api_key:
+        if not raw_key:
             await self.app(scope, receive, send)
             return
 
@@ -174,26 +178,55 @@ class IdempotencyMiddleware:
             await self._send(send, 400, _KEY_TOO_LONG_BODY, _JSON)
             return
 
-        api_key = raw_api_key.decode("latin-1")
+        body = None
+        form_authenticated = scope["path"] == self.form_api_key_path
+        if form_authenticated:
+            # The built-in Checkout route authenticates with its browser form,
+            # not X-API-Key. Buffer that keyed request first and scope the record
+            # to the credential the route will actually use. This also prevents a
+            # conflicting header from scoping a purchase under the wrong caller.
+            body, state = await self._read_body(receive)
+            if state == "disconnect":
+                return
+            if state == "overflow":
+                await self._send(send, 413, _BODY_TOO_LARGE_BODY, _JSON)
+                return
+            api_key = _form_api_key(scope["headers"], body)
+        else:
+            api_key = raw_api_key.decode("latin-1") if raw_api_key is not None else None
+
+        # A keyed Checkout must never fall through and run without a claim merely
+        # because its form is malformed or unexpectedly encoded.
+        if not api_key:
+            if form_authenticated:
+                await self._send(send, 400, _CHECKOUT_FORM_BODY, _JSON)
+                return
+            app_receive = _body_replayer(body, receive) if body is not None else receive
+            await self.app(scope, app_receive, send)
+            return
+
         # Validate the caller before touching the table: an invalid key must not
         # be able to create records, so it just falls through to the app's 401.
         if not await run_in_threadpool(self._caller_exists, api_key):
-            await self.app(scope, receive, send)
+            app_receive = _body_replayer(body, receive) if body is not None else receive
+            await self.app(scope, app_receive, send)
             return
 
         key = raw_key.decode("latin-1")
         api_key_hash = auth.get_api_key_hash(api_key)
-        body, state = await self._read_body(receive)
-        if state == "disconnect":
-            # The client aborted mid-upload. Run nothing (so no charge happens) and
-            # cache nothing — never disguise a truncated request as a completed one.
-            return
-        if state == "overflow":
-            # We can't fingerprint or cache a body we won't fully buffer, and
-            # running it uncached would break exactly-once — so reject it outright
-            # before any side effect, rather than silently downgrading.
-            await self._send(send, 413, _BODY_TOO_LARGE_BODY, _JSON)
-            return
+        if body is None:
+            body, state = await self._read_body(receive)
+            if state == "disconnect":
+                # The client aborted mid-upload. Run nothing (so no charge happens)
+                # and cache nothing — never disguise a truncated request as a
+                # completed one.
+                return
+            if state == "overflow":
+                # We can't fingerprint or cache a body we won't fully buffer, and
+                # running it uncached would break exactly-once — reject it before
+                # any side effect rather than silently downgrading.
+                await self._send(send, 413, _BODY_TOO_LARGE_BODY, _JSON)
+                return
 
         # Any request header can affect authentication, pricing, or handler output.
         # Bind all of them except the idempotency key itself into the operation
@@ -230,16 +263,7 @@ class IdempotencyMiddleware:
         # outcome == "new": run the app, capturing its response for storage.
         assert claim is not None  # noqa: S101 - guaranteed by a "new" outcome
 
-        replayed = {"done": False}
-
-        async def replay_receive():
-            # Replay the buffered body once, then delegate to the real receive so a
-            # streaming response still sees http.disconnect instead of spinning on
-            # an endlessly-repeated terminal message.
-            if not replayed["done"]:
-                replayed["done"] = True
-                return {"type": "http.request", "body": body, "more_body": False}
-            return await receive()
+        replay_receive = _body_replayer(body, receive)
 
         captured = {
             "status": 500,
@@ -577,6 +601,42 @@ class IdempotencyMiddleware:
         if created.tzinfo is None:
             created = created.replace(tzinfo=UTC)
         return (datetime.now(UTC) - created).total_seconds() > self.retention_seconds
+
+
+def _body_replayer(body: bytes, receive):
+    """Return an ASGI receive callable that replays one already-buffered body."""
+    replayed = False
+
+    async def replay_receive():
+        nonlocal replayed
+        # Delegate after the terminal body frame so streaming responses can still
+        # observe http.disconnect instead of receiving that frame forever.
+        if not replayed:
+            replayed = True
+            return {"type": "http.request", "body": body, "more_body": False}
+        return await receive()
+
+    return replay_receive
+
+
+def _form_api_key(headers, body: bytes) -> str | None:
+    """Extract the credential FastAPI will use from a URL-encoded form body."""
+    content_type = None
+    for name, value in headers:
+        if name.lower() == b"content-type":
+            content_type = value.split(b";", 1)[0].strip().lower()
+            break
+    if content_type != b"application/x-www-form-urlencoded":
+        return None
+    try:
+        values = parse_qs(
+            body.decode("utf-8"), keep_blank_values=True, max_num_fields=100
+        ).get("api_key")
+    except (UnicodeDecodeError, ValueError):
+        return None
+    # Starlette's FormData.get() returns the last occurrence of a repeated field;
+    # scoping must use the exact same credential as the Checkout route.
+    return values[-1] if values else None
 
 
 def _dump_headers(headers, extra=None) -> str:

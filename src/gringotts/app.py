@@ -46,6 +46,7 @@ def init_app(app: FastAPI, config: GringottsConfig | None = None) -> None:
             max_body_bytes=cfg.idempotency_max_body_bytes,
             max_response_bytes=cfg.idempotency_max_response_bytes,
             retention_seconds=cfg.idempotency_retention_seconds,
+            form_api_key_path=f"{cfg.mount_path}/checkout",
         )
 
     async def handle_payment_required(request: Request, exc: PaymentRequiredError):

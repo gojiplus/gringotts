@@ -144,6 +144,61 @@ def test_checkout_redirects_to_stripe(db_session, monkeypatch):
     assert order.currency == "usd"
 
 
+def test_keyed_checkout_replays_form_authenticated_session(db_session, monkeypatch):
+    _, key = auth.create_user_with_key(db_session, "checkout-retry", credits=0)
+    _, other_key = auth.create_user_with_key(db_session, "checkout-other", credits=0)
+    calls = []
+
+    def fake_create(**kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(
+            id=f"cs_checkout_{len(calls)}",
+            url=f"https://checkout.stripe.com/c/pay/{len(calls)}",
+        )
+
+    monkeypatch.setattr("stripe.checkout.Session.create", fake_create)
+    client = TestClient(make_app(), follow_redirects=False)
+    headers = {
+        "Idempotency-Key": "checkout-attempt",
+        "X-API-Key": other_key,
+    }
+    data = {"api_key": key, "pack": "0"}
+
+    first = client.post("/gringotts/checkout", data=data, headers=headers)
+    replay = client.post("/gringotts/checkout", data=data, headers=headers)
+
+    assert first.status_code == 303
+    assert replay.status_code == 303
+    assert replay.headers.get("idempotent-replayed") == "true"
+    assert replay.headers["location"] == first.headers["location"]
+    assert len(calls) == 1
+    assert db_session.query(models.CheckoutOrder).count() == 1
+    record = db_session.query(models.IdempotencyRecord).one()
+    assert record.api_key_hash == auth.get_api_key_hash(key)
+
+
+def test_keyed_checkout_with_unparseable_form_never_runs(db_session, monkeypatch):
+    _, key = auth.create_user_with_key(db_session, "checkout-fields", credits=0)
+    calls = []
+    monkeypatch.setattr(
+        "stripe.checkout.Session.create", lambda **kwargs: calls.append(kwargs)
+    )
+    fields = [*(f"unused_{i}=x" for i in range(101)), f"api_key={key}", "pack=0"]
+    response = TestClient(make_app()).post(
+        "/gringotts/checkout",
+        content="&".join(fields),
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Idempotency-Key": "too-many-fields",
+        },
+    )
+
+    assert response.status_code == 400
+    assert calls == []
+    assert db_session.query(models.CheckoutOrder).count() == 0
+    assert db_session.query(models.IdempotencyRecord).count() == 0
+
+
 def test_checkout_rejects_bad_key_and_pack(db_session, monkeypatch):
     _, key = auth.create_user_with_key(db_session, "cara", credits=0)
     monkeypatch.setattr(
@@ -152,9 +207,12 @@ def test_checkout_rejects_bad_key_and_pack(db_session, monkeypatch):
     )
     client = TestClient(make_app(), follow_redirects=False)
     bad_key = client.post(
-        "/gringotts/checkout", data={"api_key": "gk_bad", "pack": "0"}
+        "/gringotts/checkout",
+        data={"api_key": "gk_bad", "pack": "0"},
+        headers={"Idempotency-Key": "invalid-checkout"},
     )
     assert bad_key.status_code == 401
+    assert db_session.query(models.IdempotencyRecord).count() == 0
     bad_pack = client.post("/gringotts/checkout", data={"api_key": key, "pack": "9"})
     assert bad_pack.status_code == 400
 
