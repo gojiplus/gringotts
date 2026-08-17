@@ -11,6 +11,12 @@ from . import auth, models
 logger = logging.getLogger(__name__)
 
 
+def _require_integer_amount(amount: int) -> None:
+    """Reject values that cannot belong in the integer credit ledger."""
+    if isinstance(amount, bool) or not isinstance(amount, int):
+        raise TypeError("amount must be an integer")
+
+
 def create_user(
     db: Session,
     username: str,
@@ -20,6 +26,7 @@ def create_user(
     is_admin: bool = False,
 ) -> models.User:
     """Create a user, recording any initial credits as a grant ledger row."""
+    _require_integer_amount(credits)
     user = models.User(
         username=username,
         api_key_hash=api_key_hash,
@@ -72,6 +79,7 @@ def charge_user(
     must never raise a balance. Safe retries are handled one layer up by
     :class:`~gringotts.idempotency.IdempotencyMiddleware`, not here.
     """
+    _require_integer_amount(cost)
     if cost < 0:
         raise ValueError("charge cost cannot be negative")
     if cost == 0:
@@ -108,6 +116,7 @@ def refund_user(
     An `amount` of 0 is a no-op that writes no ledger row; a negative `amount`
     raises ValueError, since a refund must never deduct.
     """
+    _require_integer_amount(amount)
     if amount < 0:
         raise ValueError("refund amount cannot be negative")
     if amount == 0:
@@ -146,6 +155,7 @@ def grant_credits(
     since a grant must never deduct. HTTP-level safe-retry for the admin grant
     route is handled by :class:`~gringotts.idempotency.IdempotencyMiddleware`.
     """
+    _require_integer_amount(amount)
     if amount < 0:
         raise ValueError("grant amount cannot be negative")
     db.query(models.User).filter(models.User.id == user.id).update(
@@ -280,6 +290,7 @@ def clawback_credits(
     `amount_cents` records the reversed money and `payment_intent_id` ties the row
     to its purchase, so cumulative clawback math stays exact across partials.
     """
+    _require_integer_amount(amount)
     if amount < 0:
         raise ValueError("clawback amount cannot be negative")
     # Lock the user row so the clamp reads a stable balance (Postgres); SQLite

@@ -23,13 +23,14 @@ Design choices (documented, not incidental):
 - **A fingerprint** (method + path + query + body) guards the key: reusing it for
   a materially different request returns ``409`` rather than the wrong cached
   response.
-- **A confirmed refund releases the key; a committed charge keeps it.** gringotts
+- **Complete compensation releases the key; a committed charge keeps it.** gringotts
   charges *before* the handler runs, and ``Depends(charge())`` compensates on a
-  raised exception. The key is released only after that refund commits, so a genuine
-  retry can re-attempt. If compensation fails, the key stays locked because the debit
-  still stands. Any response the handler *returns* (2xx, 4xx, even a 5xx it returns
-  itself) leaves the charge committed and is cached, so a retry can't run it again.
-  A caller who wants a fresh attempt uses a fresh key.
+  raised exception. The key is released only after every charge from the request has
+  a confirmed refund for the exact total, so a genuine retry can re-attempt. If any
+  compensation fails, the key stays locked because a debit still stands. Any response
+  the handler *returns* (2xx, 4xx, even a 5xx it returns itself) leaves the charge
+  committed and is cached, so a retry can't run it again. A caller who wants a fresh
+  attempt uses a fresh key.
 - **An in-flight or crashed request is never re-run automatically.** A concurrent
   duplicate, and any retry of a request whose outcome is unknown, gets ``409`` —
   because age alone can't prove the first attempt didn't already charge. Records
@@ -248,10 +249,9 @@ class IdempotencyMiddleware:
         try:
             await self.app(scope, replay_receive, send_wrapper)
         except Exception:
-            # Release the key ONLY on a confirmed refund (net-zero charge). A
-            # committed-but-not-refunded charge — including one whose refund failed
-            # — must keep the key locked so a retry can't double it. If the refund
-            # committed, a retry can safely re-attempt.
+            # Release the key ONLY when every charge is fully compensated. A
+            # committed-but-not-refunded charge — including one of several whose
+            # refund failed — must keep the key locked so a retry can't double it.
             if _refunded(scope):
                 await run_in_threadpool(self._delete, claim)
             else:
@@ -572,13 +572,19 @@ def _is_bodyless(status: int) -> bool:
 
 
 def _refunded(scope) -> bool:
-    """Whether the charge dependency signalled a *confirmed* refund of this request."""
-    return bool(scope.get("gringotts_idempotency", {}).get("refunded"))
+    """Whether every charge in this request has an exact confirmed refund."""
+    state = scope.get("gringotts_idempotency", {})
+    charge_count = state.get("charge_count", 0)
+    return (
+        charge_count > 0
+        and state.get("refund_count", 0) == charge_count
+        and state.get("refunded_credits", 0) == state.get("charged_credits", 0)
+    )
 
 
 def _committed(scope) -> bool:
-    """Whether the charge dependency signalled it committed a charge this request."""
-    return bool(scope.get("gringotts_idempotency", {}).get("committed"))
+    """Whether at least one charge dependency committed in this request."""
+    return scope.get("gringotts_idempotency", {}).get("charge_count", 0) > 0
 
 
 def _is_slash_redirect(status: int, headers, path: str) -> bool:

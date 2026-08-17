@@ -112,9 +112,52 @@ def _apply_reversal(
     )
 
 
-def _process_refund(db, event) -> None:
+def _process_refund(db, event, *, stripe_secret_key: str | None) -> None:
     """Claw back credits for a settled Stripe refund (clamped at zero)."""
     refund = event["data"]["object"]
+    try:
+        status = refund["status"]
+    except (KeyError, TypeError):
+        status = None
+    if status is None:
+        try:
+            refund_id = refund["id"]
+        except (KeyError, TypeError):
+            refund_id = None
+        if not isinstance(refund_id, str) or not refund_id or not stripe_secret_key:
+            logger.error(
+                "gringotts webhook %s: refund status cannot be retrieved",
+                event["id"],
+            )
+            raise HTTPException(
+                status_code=503, detail="Refund status unavailable; retry later"
+            )
+        try:
+            # Event payloads are immutable and retain the webhook endpoint's API
+            # version. Retrieve the current object rather than retrying the same
+            # incomplete snapshot forever.
+            refund = stripe.Refund.retrieve(refund_id, api_key=stripe_secret_key)
+            status = refund["status"]
+        except stripe.StripeError as err:
+            logger.warning(
+                "gringotts webhook %s: could not retrieve refund %s",
+                event["id"],
+                refund_id,
+            )
+            raise HTTPException(
+                status_code=503, detail="Refund status unavailable; retry later"
+            ) from err
+        except (KeyError, TypeError):
+            status = None
+        if status is None:
+            logger.error(
+                "gringotts webhook %s: retrieved refund %s has no status",
+                event["id"],
+                refund_id,
+            )
+            raise HTTPException(
+                status_code=503, detail="Refund status unavailable; retry later"
+            )
     try:
         payment_intent = _expandable_id(refund["payment_intent"])
         refund_id = refund["id"]
@@ -129,13 +172,6 @@ def _process_refund(db, event) -> None:
         raise HTTPException(
             status_code=503, detail="Refund data incomplete; retry later"
         )
-    try:
-        status = refund["status"]
-    except (KeyError, TypeError):
-        logger.error("gringotts webhook %s: refund status missing", event["id"])
-        raise HTTPException(
-            status_code=503, detail="Refund status missing; retry later"
-        ) from None
     if status != "succeeded":
         # A pending/failed/canceled refund hasn't returned money — wait for the
         # refund.updated that flips it to succeeded (no row written yet, so that
@@ -503,7 +539,7 @@ def build_router(config: GringottsConfig) -> APIRouter:
                     session_id,
                 )
         elif event["type"] in _REFUND_EVENTS:
-            _process_refund(db, event)
+            _process_refund(db, event, stripe_secret_key=config.stripe_secret_key)
         elif event["type"] == _DISPUTE_WITHDRAWN:
             _process_dispute(db, event, reinstate=False)
         elif event["type"] == _DISPUTE_REINSTATED:

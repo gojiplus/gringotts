@@ -304,11 +304,38 @@ def test_pending_refund_is_not_clawed_until_succeeded(db_session):
     assert user.credits == 0
 
 
-def test_refund_without_status_asks_retry(db_session):
+def test_refund_without_status_retrieves_current_object(db_session, monkeypatch):
     client = _client()
     user = _buy(db_session, client, "p_missing_status")
     refund = json.loads(_refund_event("pi_1", 500).decode())
     del refund["data"]["object"]["status"]
+
+    def retrieve(refund_id, *, api_key):
+        assert refund_id == "re_1"
+        assert api_key == "sk_test_x"
+        return {
+            "id": refund_id,
+            "object": "refund",
+            "payment_intent": "pi_1",
+            "amount": 500,
+            "status": "succeeded",
+        }
+
+    monkeypatch.setattr("stripe.Refund.retrieve", retrieve)
+    assert _post(client, json.dumps(refund).encode()).status_code == 200
+    db_session.refresh(user)
+    assert user.credits == 0
+
+
+def test_refund_still_missing_status_after_retrieval_asks_retry(
+    db_session, monkeypatch
+):
+    client = _client()
+    user = _buy(db_session, client, "p_status_unavailable")
+    refund = json.loads(_refund_event("pi_1", 500).decode())
+    del refund["data"]["object"]["status"]
+    monkeypatch.setattr("stripe.Refund.retrieve", lambda *args, **kwargs: refund)
+
     assert _post(client, json.dumps(refund).encode()).status_code == 503
     db_session.refresh(user)
     assert user.credits == 100

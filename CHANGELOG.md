@@ -57,7 +57,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Fixed
 
 - A failed compensating refund no longer releases an idempotency key and permits a
-  second debit; only a confirmed refund makes the request retryable.
+  second debit; when a request has multiple charges, every debit must have an exact
+  confirmed refund before the request becomes retryable.
 - Concurrent first attempts are serialized by the caller/key claim, and stale
   requests cannot mutate a newer claim after emergency in-flight pruning and
   primary-key reuse.
@@ -68,9 +69,14 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   longer produces a spurious in-progress conflict.
 - Proportional Stripe clawbacks use exact integer rounding rather than floats, so
   large credit balances cannot be over- or under-clawed through precision loss.
+- Credit movements and pack prices reject fractional, string, and Boolean quantities
+  at runtime so SQLite, dynamic pricing, and Checkout configuration cannot admit
+  non-integers into the ledger or payment flow.
 - Paid Checkout, refund, and dispute events with incomplete settlement data return a
   retryable error instead of granting or clawing credits from an unverifiable
-  event snapshot.
+  event snapshot. When an immutable refund event omits its settlement status,
+  Gringotts retrieves the current Refund from Stripe instead of retrying that same
+  incomplete snapshot forever.
 
 ### Upgrading
 

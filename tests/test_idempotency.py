@@ -792,6 +792,91 @@ def test_refund_failure_keeps_key_locked(db_session, monkeypatch):
     assert user.credits == 8  # the un-refunded charge stands once, never doubled
 
 
+def test_partial_refund_across_multiple_charges_keeps_key_locked(
+    db_session, monkeypatch
+):
+    app = FastAPI()
+    gringotts.init_app(app, GringottsConfig())
+    calls = 0
+
+    @app.get("/multi-refund")
+    def multi_refund(
+        first: CreditedUser = Depends(charge(2)),
+        second: CreditedUser = Depends(charge(3)),
+    ):
+        nonlocal calls
+        calls += 1
+        raise RuntimeError("handler failure")
+
+    user, key = auth.create_user_with_key(db_session, "mr", credits=10)
+    original_refund = crud.refund_user
+    refund_calls = 0
+
+    def fail_first_refund(*args, **kwargs):
+        nonlocal refund_calls
+        refund_calls += 1
+        if refund_calls == 1:
+            raise RuntimeError("one refund failed")
+        return original_refund(*args, **kwargs)
+
+    monkeypatch.setattr(crud, "refund_user", fail_first_refund)
+    client = TestClient(app, raise_server_exceptions=False)
+    headers = {"X-API-Key": key, "Idempotency-Key": "mrk"}
+
+    assert client.get("/multi-refund", headers=headers).status_code == 500
+    db_session.refresh(user)
+    balance_after_partial_refund = user.credits
+    replay = client.get("/multi-refund", headers=headers)
+
+    assert replay.status_code == 500
+    assert replay.headers.get("idempotent-replayed") == "true"
+    assert calls == 1
+    assert refund_calls == 2
+    db_session.refresh(user)
+    assert user.credits == balance_after_partial_refund
+    assert user.credits in (7, 8)
+    assert (
+        db_session.query(models.CreditTransaction).filter_by(kind="charge").count() == 2
+    )
+    assert (
+        db_session.query(models.CreditTransaction).filter_by(kind="refund").count() == 1
+    )
+
+
+def test_full_refund_across_multiple_charges_releases_key(db_session):
+    app = FastAPI()
+    gringotts.init_app(app, GringottsConfig())
+    calls = 0
+
+    @app.get("/multi-retry")
+    def multi_retry(
+        first: CreditedUser = Depends(charge(2)),
+        second: CreditedUser = Depends(charge(3)),
+    ):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("transient handler failure")
+        return {"ok": True}
+
+    user, key = auth.create_user_with_key(db_session, "ms", credits=10)
+    client = TestClient(app, raise_server_exceptions=False)
+    headers = {"X-API-Key": key, "Idempotency-Key": "msk"}
+
+    assert client.get("/multi-retry", headers=headers).status_code == 500
+    assert client.get("/multi-retry", headers=headers).status_code == 200
+
+    assert calls == 2
+    db_session.refresh(user)
+    assert user.credits == 5
+    assert (
+        db_session.query(models.CreditTransaction).filter_by(kind="charge").count() == 4
+    )
+    assert (
+        db_session.query(models.CreditTransaction).filter_by(kind="refund").count() == 2
+    )
+
+
 def test_old_request_cannot_mutate_reused_record_id(db_session):
     middleware = IdempotencyMiddleware(None)
     outcome, old_claim, _ = middleware._claim("caller-a", "old", "fingerprint-a")

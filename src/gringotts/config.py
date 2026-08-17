@@ -61,6 +61,10 @@ class CreditPack:
 
     def __post_init__(self) -> None:
         """Reject packs that would charge for nothing or subtract credits."""
+        if isinstance(self.credits, bool) or not isinstance(self.credits, int):
+            raise TypeError("CreditPack.credits must be an integer")
+        if isinstance(self.price_cents, bool) or not isinstance(self.price_cents, int):
+            raise TypeError("CreditPack.price_cents must be an integer")
         if self.credits <= 0:
             raise ValueError("CreditPack.credits must be positive")
         if self.price_cents < 0:

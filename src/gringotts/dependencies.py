@@ -68,17 +68,21 @@ def charge(cost: CostSpec) -> Callable[..., Iterator[User]]:
         try:
             user = authenticate(session, request.headers.get(API_KEY_HEADER))
             amount = cost(request) if callable(cost) else cost
+            if isinstance(amount, bool) or not isinstance(amount, int):
+                raise HTTPException(status_code=400, detail="Invalid credit cost")
             if amount < 0:
                 raise HTTPException(status_code=400, detail="Invalid credit cost")
             endpoint = request.url.path
             if not crud.charge_user(session, user, amount, endpoint=endpoint):
                 raise PaymentRequiredError(cost=amount, balance=user.credits)
             scope = getattr(request, "scope", None)
-            if amount and scope is not None:
+            if scope is not None:
                 # The debit is durable from this point onward. Idempotency must
                 # keep the key unless compensation is later confirmed, otherwise
                 # a failed refund followed by a retry can charge twice.
-                scope.setdefault("gringotts_idempotency", {})["committed"] = True
+                state = scope.setdefault("gringotts_idempotency", {})
+                state["charge_count"] = state.get("charge_count", 0) + 1
+                state["charged_credits"] = state.get("charged_credits", 0) + amount
             user_id = user.id
             try:
                 yield user
@@ -92,7 +96,11 @@ def charge(cost: CostSpec) -> Callable[..., Iterator[User]]:
                 # Release the key only after compensation committed. A failed
                 # refund leaves the debit standing, so a retry must be blocked.
                 if refunded and scope is not None:
-                    scope.setdefault("gringotts_idempotency", {})["refunded"] = True
+                    state = scope.setdefault("gringotts_idempotency", {})
+                    state["refund_count"] = state.get("refund_count", 0) + 1
+                    state["refunded_credits"] = (
+                        state.get("refunded_credits", 0) + amount
+                    )
                 raise
         finally:
             session.close()

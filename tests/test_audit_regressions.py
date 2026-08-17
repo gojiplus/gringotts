@@ -61,6 +61,28 @@ def test_c1_charge_user_rejects_negative(db_session):
         crud.charge_user(db_session, user, -10)
 
 
+@pytest.mark.parametrize("invalid_cost", [1.5, "2", True])
+def test_c1_callable_cost_must_be_an_integer(db_session, invalid_cost):
+    app = FastAPI()
+    gringotts.init_app(app, GringottsConfig())
+
+    @app.get("/typed-cost")
+    def typed_cost(
+        user: CreditedUser = Depends(charge(lambda request: invalid_cost)),
+    ):
+        return {"credits": user.credits}
+
+    user, key = auth.create_user_with_key(db_session, "typed", credits=5)
+    response = TestClient(app, raise_server_exceptions=False).get(
+        "/typed-cost", headers={"X-API-Key": key}
+    )
+
+    assert response.status_code == 400
+    db_session.refresh(user)
+    assert user.credits == 5
+    assert ledger_sum(db_session, user.id) == 5
+
+
 # ---- C4: charge() must not touch the host's session ------------------------
 def test_c4_refund_survives_host_session_error(db_session):
     """Host handler poisons its own request session; the refund must still land."""
@@ -141,6 +163,17 @@ def test_c5_credit_pack_rejects_nonpositive():
         CreditPack(credits=0, price_cents=500, name="Bad")
     with pytest.raises(ValueError, match="credits must be positive"):
         CreditPack(credits=-5, price_cents=500, name="Bad")
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("credits", 1.5), ("credits", True), ("price_cents", 499.5)],
+)
+def test_c5_credit_pack_requires_integer_quantities(field, value):
+    values = {"credits": 100, "price_cents": 500, "name": "Bad"}
+    values[field] = value
+    with pytest.raises(TypeError, match=f"CreditPack.{field} must be an integer"):
+        CreditPack(**values)
 
 
 def test_c5_grant_credits_rejects_negative(db_session):
