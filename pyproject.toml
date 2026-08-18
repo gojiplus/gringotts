@@ -1,6 +1,6 @@
 [build-system]
-requires = ["hatchling>=1.31.0", "uv-dynamic-versioning"]
-build-backend = "hatchling.build"
+requires = ["uv_build>=0.12.5,<0.13"]
+build-backend = "uv_build"
 
 [project]
 name = "gringotts-api"
@@ -31,7 +31,7 @@ dependencies = [
   "stripe>=10.0",
   "python-multipart>=0.0.9",
 ]
-dynamic = ["version"]
+version = "0.4.0"
 
 [project.urls]
 Homepage = "https://github.com/gojiplus/gringotts"
@@ -66,27 +66,31 @@ docs = [
   "py-canon @ git+https://github.com/gojiplus/py-canon@v1",
 ]
 
-[tool.hatch.build.targets.wheel]
-packages = ["src/gringotts"]
-
-[tool.hatch.version]
-source = "uv-dynamic-versioning"
-
-[tool.uv-dynamic-versioning]
-vcs = "git"
-style = "pep440"
-
 [tool.ruff]
 line-length = 88
 target-version = "py311"
 
 [tool.ruff.lint]
 external = ["DOC"]
-select = ["E", "W", "F", "I", "B", "C4", "UP", "N", "D", "S", "SIM", "T20", "PT", "RUF"]
-ignore = ["D203", "D213"]
+select = [
+    "E", "W", "F", "I", "B", "C4", "UP", "N", "D", "S", "SIM", "T20", "PT", "RUF",
+    "PTH", "RET", "PIE", "FURB", "PERF", "DTZ", "LOG", "G", "TC", "FLY",
+    "RSE", "SLOT", "FA", "A", "EXE", "ICN", "PGH", "PLE", "ARG", "SLF",
+]
+# D203/D213: the google convention the fleet standard picks. W191/D206/D300:
+# ruff's own docs list these as always incompatible with `ruff format`, which
+# the standard also runs.
+ignore = ["D203", "D213", "W191", "D206", "D300", "A001", "A002"]
 
 [tool.ruff.lint.pydocstyle]
 convention = "google"
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101", "D", "ARG", "SLF", "S105", "S106"]
+"docs/**" = ["D"]
+"examples/**" = ["T20", "D", "S311"]
+"src/gringotts/cli.py" = ["T20"]
+"src/gringotts/admin.py" = ["ARG001"]
 
 [tool.ruff.lint.flake8-bugbear]
 extend-immutable-calls = [
@@ -97,12 +101,6 @@ extend-immutable-calls = [
   "charge",
   "gringotts.charge",
 ]
-
-[tool.ruff.lint.per-file-ignores]
-"tests/**" = ["S101", "S105", "S106", "D"]
-"docs/**" = ["D"]
-"examples/**" = ["T20", "D", "S311"]
-"src/gringotts/cli.py" = ["T20"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -129,4 +127,7 @@ allow-init-docstring = true
 exclude = '\.venv|tests|docs'
 
 [tool.codespell]
-skip = "*.min.js"
+skip = "*.min.js,docs/_build/*"
+
+[tool.uv.build-backend]
+module-name = "gringotts"
