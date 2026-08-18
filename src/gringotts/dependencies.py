@@ -24,10 +24,10 @@ API_KEY_HEADER = "X-API-Key"
 def authenticate(db: Session, api_key: str | None) -> User:
     """Resolve an API key to its user or raise a 401."""
     if not api_key:
-        raise InvalidAPIKeyError()
+        raise InvalidAPIKeyError
     user = crud.get_user_by_api_key(db, api_key)
     if user is None:
-        raise InvalidAPIKeyError()
+        raise InvalidAPIKeyError
     return user
 
 

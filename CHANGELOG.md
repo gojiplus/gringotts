@@ -6,6 +6,12 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- Adopted the py-canon package standard, including the native uv build backend
+  and shared CI, documentation, and release workflows. PostgreSQL and
+  lower-bound testing remain as package-specific CI jobs.
+
 ## [0.4.0] - 2026-08-17
 
 ### Added
