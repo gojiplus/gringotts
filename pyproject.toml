@@ -107,7 +107,17 @@ testpaths = ["tests"]
 minversion = "6"
 log_level = "INFO"
 xfail_strict = true
-filterwarnings = ["error"]
+filterwarnings = [
+    "error",
+    # FastAPI builds a pydantic field per route parameter and attaches an
+    # alias to it, which pydantic 2.13 reports as having no effect. Nothing
+    # in gringotts calls Field() -- the alias is whatever the parameter is
+    # named, 'user_id' for a path parameter and 'body' for a request body,
+    # so this is matched on the sentence rather than the value. fastapi
+    # 0.141.1 and pydantic 2.13.4 are both the current releases, so there is
+    # no upgrade to take; drop this when one of them stops.
+    "ignore:The 'alias' attribute with value:pydantic.warnings.UnsupportedFieldAttributeWarning",
+]
 addopts = ["--strict-config", "--strict-markers", "-ra"]
 
 [tool.coverage.run]
