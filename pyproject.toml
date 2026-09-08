@@ -9,7 +9,7 @@ readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
 authors = [{ name = "Gaurav Sood", email = "gsood07@gmail.com" }]
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 keywords = [
   "fastapi",
   "stripe",
@@ -68,7 +68,7 @@ docs = [
 
 [tool.ruff]
 line-length = 88
-target-version = "py311"
+target-version = "py312"
 
 [tool.ruff.lint]
 external = ["DOC"]
@@ -117,6 +117,12 @@ filterwarnings = [
     # 0.141.1 and pydantic 2.13.4 are both the current releases, so there is
     # no upgrade to take; drop this when one of them stops.
     "ignore:The 'alias' attribute with value:pydantic.warnings.UnsupportedFieldAttributeWarning",
+    # starlette 1.6.0, the current release, imports anyio.abc.BlockingPortal in
+    # its test client; anyio 4.15 deprecated that alias. starlette main already
+    # uses anyio.from_thread.BlockingPortal, so drop this at the next starlette
+    # release. Only the wheel job sees it: that job installs unpinned, while
+    # the test jobs run the lock, where anyio is still 4.14.
+    "ignore:The anyio.abc.BlockingPortal alias is deprecated:DeprecationWarning",
 ]
 addopts = ["--strict-config", "--strict-markers", "-ra"]
 
