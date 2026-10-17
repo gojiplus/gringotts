@@ -552,7 +552,7 @@ def build_router(config: GringottsConfig) -> APIRouter:
                 "<p><strong>Payment received — credits are on their way.</strong></p>"
             )
         elif status == "cancelled":
-            status_html = "<p>Payment cancelled.</p>"
+            status_html = "<p>Payment canceled.</p>"
         checkout_path = f"{config.mount_path}/checkout"
         return _BUY_PAGE.format(
             status=status_html, checkout_path=checkout_path, pack_inputs=pack_inputs

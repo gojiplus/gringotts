@@ -148,6 +148,9 @@ allow-init-docstring = true
 exclude = '\.venv|tests|docs'
 
 [tool.codespell]
+builtin = "clear,rare,en-GB_to_en-US"
+# Payment callback status values retain their spelling.
+ignore-regex = '''(?<=status=)cancelled\b|["']cancelled["']'''  # codespell:ignore cancelled
 skip = "*.min.js,docs/_build/*"
 
 [tool.uv.build-backend]
