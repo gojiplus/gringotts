@@ -339,7 +339,7 @@ def clawback_totals(db: Session, payment_intent_id: str) -> tuple[int, int]:
         )
         .one()
     )
-    return int(row[0]), int(row[1])
+    return int(row[0] or 0), int(row[1] or 0)
 
 
 def clawback_credits(
