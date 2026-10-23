@@ -493,17 +493,7 @@ def build_router(config: GringottsConfig) -> APIRouter:
         )
         return {
             "balance": user.credits,
-            "transactions": [
-                {
-                    "amount": t.amount,
-                    "kind": t.kind,
-                    "endpoint": t.endpoint,
-                    "amount_cents": t.amount_cents,
-                    "currency": t.currency,
-                    "created_at": t.created_at.isoformat(),
-                }
-                for t in transactions
-            ],
+            "transactions": crud.serialize_transactions(transactions),
         }
 
     @router.get("/account", response_class=HTMLResponse)

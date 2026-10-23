@@ -216,3 +216,57 @@ def test_account_panel_fragment(db_session):
     assert res.status_code == 200
     assert "credits remaining" in res.text
     assert client.get("/gringotts/account/panel").status_code == 401
+
+
+def test_usage_transaction_json_is_pinned_and_shared(db_session):
+    _, admin_key = make_admin(db_session)
+    user, key = auth.create_user_with_key(db_session, "ada", credits=5)
+    client = TestClient(make_app())
+    client.get("/hello", headers={"X-API-Key": key})
+    crud.grant_credits(
+        db_session,
+        user,
+        100,
+        kind="purchase",
+        external_id="evt_a",
+        amount_cents=500,
+        currency="usd",
+    )
+    created = [
+        t.created_at.isoformat()
+        for t in crud.list_transactions(db_session, user_id=user.id)
+    ]
+    expected = [
+        {
+            "amount": 100,
+            "kind": "purchase",
+            "endpoint": None,
+            "amount_cents": 500,
+            "currency": "usd",
+            "created_at": created[0],
+        },
+        {
+            "amount": -2,
+            "kind": "charge",
+            "endpoint": "/hello",
+            "amount_cents": None,
+            "currency": None,
+            "created_at": created[1],
+        },
+        {
+            "amount": 5,
+            "kind": "grant",
+            "endpoint": None,
+            "amount_cents": None,
+            "currency": None,
+            "created_at": created[2],
+        },
+    ]
+
+    own = client.get("/gringotts/usage", headers={"X-API-Key": key}).json()
+    assert own == {"balance": 103, "transactions": expected}
+
+    admin_view = client.get(
+        f"/gringotts/admin/users/{user.id}/usage", headers={"X-API-Key": admin_key}
+    ).json()
+    assert admin_view == {"username": "ada", "balance": 103, "transactions": expected}
