@@ -432,6 +432,23 @@ def list_transactions(
     )
 
 
+def serialize_transactions(
+    transactions: list[models.CreditTransaction],
+) -> list[dict]:
+    """Return the JSON shape of ledger rows used by the usage endpoints."""
+    return [
+        {
+            "amount": t.amount,
+            "kind": t.kind,
+            "endpoint": t.endpoint,
+            "amount_cents": t.amount_cents,
+            "currency": t.currency,
+            "created_at": t.created_at.isoformat(),
+        }
+        for t in transactions
+    ]
+
+
 def list_users_with_stats(db: Session) -> list[dict]:
     """Return, per user, balance plus consumption and last activity from the ledger.
 
