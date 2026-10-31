@@ -1,4 +1,4 @@
-# Gringotts
+# gringotts: prepaid credits for your FastAPI
 
 [![PyPI version](https://img.shields.io/pypi/v/gringotts-api.svg)](https://pypi.org/project/gringotts-api/)
 [![Downloads](https://static.pepy.tech/badge/gringotts-api)](https://pepy.tech/project/gringotts-api)
