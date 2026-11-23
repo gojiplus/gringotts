@@ -9,7 +9,7 @@ readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
 authors = [{ name = "Gaurav Sood" }]
-requires-python = ">=3.12"
+requires-python = ">=3.13"
 keywords = [
   "fastapi",
   "stripe",
@@ -68,7 +68,7 @@ docs = [
 
 [tool.ruff]
 line-length = 88
-target-version = "py312"
+target-version = "py313"
 
 [tool.ruff.lint]
 external = ["DOC"]
