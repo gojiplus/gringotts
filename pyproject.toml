@@ -28,7 +28,7 @@ classifiers = [
 dependencies = [
   "fastapi>=0.118.0",
   "sqlalchemy>=2.0.44",
-  "stripe>=10.0",
+  "stripe>=11.4.0",
   "python-multipart>=0.0.9",
 ]
 version = "0.4.0"
